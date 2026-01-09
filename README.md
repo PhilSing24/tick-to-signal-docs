@@ -6,7 +6,7 @@ This project is a production-grade implementation of a real-time cryptocurrency 
 
 The goal is to demonstrate that thoughtful architecture and code quality can achieve production-grade performance without enterprise-scale infrastructure.
 
-## Dashboards
+## The System in Action
 
 **Feed Handler Monitoring** — Health status and latency metrics for trade and quote ingestion.
 
