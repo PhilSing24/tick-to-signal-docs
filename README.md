@@ -6,6 +6,16 @@ This project is a production-grade implementation of a real-time cryptocurrency 
 
 The goal is to demonstrate that thoughtful architecture and code quality can achieve production-grade performance without enterprise-scale infrastructure.
 
+## Dashboards
+
+**Feed Handler Monitoring** — Health status and latency metrics for trade and quote ingestion.
+
+![Feed Handler Monitoring](images/FeedhandlerMonitoringView.png)
+
+**Dataflow Monitoring** — Data volume, system resources, and end-to-end latency breakdown.
+
+![Dataflow Monitoring](images/DataFlowMonitoringView.png)
+
 ## Technology Choices
 
 **C++** for the feed handlers—direct control over memory layout, deterministic performance, and efficient integration with WebSocket libraries and the kdb+ IPC interface. For latency-sensitive ingestion where every microsecond matters, C++ remains the right tool.
