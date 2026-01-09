@@ -25,9 +25,20 @@ Source maintained in Overleaf.
 | [009](decisions/adr-009-L5-Order-Book-Architecture.md) | L5 Order Book Architecture |
 | [010](decisions/adr-010-Log-Management-And-Lifecycle.md) | Log Management and Lifecycle |
 
+## Specs
+
+- [api-binance.md](specs/api-binance.md) - Binance WebSocket API reference
+- [trades-schema.md](specs/trades-schema.md) - Trade message schema
+- [quotes-schema.md](specs/quotes-schema.md) - Quote message schema
+
 ## Reference
 
-- [reference/](reference/) - Design references and external documentation
+- [DataIntellect_Real_Time_KDBX.pdf](reference/DataIntellect_Real_Time_KDBX.pdf) - Building Real-Time Event-Driven KDB-X Systems
+- [kdbx-real-time-architecture-reference.md](reference/kdbx-real-time-architecture-reference.md) - AI-friendly text version
+
+## Notes
+
+- [kdbx-real-time-architecture-measurement-notes.md](notes/kdbx-real-time-architecture-measurement-notes.md) - Latency measurement implementation notes
 
 ## License
 
