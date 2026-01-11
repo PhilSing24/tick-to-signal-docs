@@ -53,7 +53,8 @@ Telemetry is embedded throughout the system. Every event carries nanosecond time
 
 ## Code
 
-The implementation lives in a separate repository: [tick-to-signal](https://github.com/PhilSing24/tick-to-signal)
+The implementation lives in a separate repository: [tick-to-signal](https://github.com/PhilSing24/tick-to-signal). The code repository is private. 
+If you're interested in the implementation or have questions, feel free to reach out via [LinkedIn](https://www.linkedin.com/in/phdamay) or open an issue in this repository.
 
 ## White Paper
 
@@ -61,6 +62,3 @@ The implementation lives in a separate repository: [tick-to-signal](https://gith
 
 Draft available at [paper/tick-data-to-signals-v1.0-draft.pdf](paper/tick-data-to-signals-v1.0-draft.pdf).
 
-## Access
-
-The code repository is private. If you're interested in the implementation or have questions, feel free to reach out via [LinkedIn](https://www.linkedin.com/in/phdamay) or open an issue in this repository.
