@@ -4,7 +4,7 @@
 
 This project is a production-grade real-time cryptocurrency analytics system. It ingests live market data from Binance WebSocket streams via C++ feed handlers, and computes analytics in kdb+:
 
-- **VWAP**, **Volatility** and **Correlation** and  from tick data
+- **VWAP**, **Volatility** and **Correlation** from tick data
 - **Order book imbalance** from L2 snapshots with 5 levels of depth
 
 All metrics are delivered to downstream consumers with minimal latency.
@@ -38,11 +38,8 @@ The goal is to demonstrate that thoughtful architecture and code quality can ach
 
 ## Observability by Design
 
-Telemetry is embedded throughout the system. Every event carries nanosecond timestamps at ingestion, microsecond measurements for parsing and IPC, and sequence numbers for gap detection. The architecture is designed not just to perform, but to reveal where it can perform better. You cannot optimize what you cannot measure.
+Telemetry is embedded throughout the system. Every event carries nanosecond timestamps at ingestion, microsecond measurements for parsing and IPC, and sequence numbers for gap detection. You cannot optimize what you cannot measure.
 
-## Performance Without Compromise
-
-Low latency and production-grade reliability were goals throughout the project. Every design decision kept both in mind.
 
 ## Repository Structure
 
