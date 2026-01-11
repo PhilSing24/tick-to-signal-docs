@@ -4,7 +4,7 @@
 
 This project is a production-grade real-time cryptocurrency analytics system. It ingests live market data from Binance WebSocket streams via C++ feed handlers, and computes analytics in kdb+:
 
-- **VWAP**, **Volatility** **Volatility** and  from tick data
+- **VWAP**, **Volatility** and **Correlation** and  from tick data
 - **Order book imbalance** from L2 snapshots with 5 levels of depth
 
 All metrics are delivered to downstream consumers with minimal latency.
