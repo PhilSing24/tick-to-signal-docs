@@ -2,11 +2,9 @@
 
 **Real-Time Crypto Analytics on KDB-X**
 
-**Real-Time Crypto Analytics on KDB-X**
-
 This project is a production-grade real-time cryptocurrency analytics system. It ingests live market data from Binance WebSocket streams via C++ feed handlers, and computes analytics in kdb+:
 
-- **VWAP** and **Variance-Covariance matrix** from tick data
+- **VWAP**, **Volatility** **Volatility** and  from tick data
 - **Order book imbalance** from L2 snapshots with 5 levels of depth
 
 All metrics are delivered to downstream consumers with minimal latency.
@@ -22,6 +20,15 @@ The goal is to demonstrate that thoughtful architecture and code quality can ach
 **Dataflow Monitoring** — Data volume, system resources, and end-to-end latency breakdown.
 
 ![Dataflow Monitoring](images/DataFlowMonitoringView.png)
+
+**Trades and Quotes Monitoring** — Order Book and OHLC 
+
+![Trades and Quotes Monitoring](images/TradesQuotesView.png)
+
+**Analytics** — VWAP, Volatility, Correlation, Order Book Imbalance
+
+![Analytics Monitoring](images/AnalyticsView.png)
+
 
 ## Technology Choices
 
