@@ -1,11 +1,11 @@
 # ADR-003: Tickerplant Logging and Durability Strategy
 
 ## Status
-Accepted (Updated 2026-01-06)
+Accepted (Updated 2026-01-09)
 
 ## Date
 Original: 2025-12-17
-Updated: 2025-12-29, 2026-01-06
+Updated: 2025-12-29, 2026-01-06, 2026-01-09
 
 ## Context
 
@@ -36,21 +36,19 @@ A key design decision is whether and how the tickerplant should log incoming upd
 
 ## Decision
 
-The tickerplant logs market data updates to **separate binary log files** per data type.
+The tickerplant logs market data updates to a **single binary log file** per day, preserving chronological order across all tables. This follows the standard `tick.q` pattern.
 
 ### Log File Structure
 ```
 logs/
-  2025.12.29.trade.log   # Trade events only
-  2025.12.29.quote.log   # Quote events only
+  2025.12.29.log   # All market data events (trades + quotes) in arrival order
 ```
 
 ### Log File Naming
 
-| Data Type | Pattern | Example |
-|-----------|---------|---------|
-| Trades | `YYYY.MM.DD.trade.log` | `2025.12.29.trade.log` |
-| Quotes | `YYYY.MM.DD.quote.log` | `2025.12.29.quote.log` |
+| Pattern | Example |
+|---------|---------|
+| `YYYY.MM.DD.log` | `2025.12.29.log` |
 
 ### Logging Configuration
 ```q
@@ -60,20 +58,21 @@ logs/
 
 ### Implementation
 
-The TP maintains separate file handles:
+The TP maintains a single file handle:
 ```q
-.tp.tradeLogHandle   / Handle for trade log
-.tp.quoteLogHandle   / Handle for quote log
+.tp.logHandle    / Handle for combined log
+.tp.logFile      / Current log file path
+.tp.logCount     / Message counter
 ```
 
-Routing logic in `.tp.log`:
+Logging logic in `.tp.log`:
 ```q
 .tp.log:{[tbl;data]
   if[not .tp.cfg.logEnabled; :()];
-  $[tbl = `trade_binance;
-    .tp.tradeLogHandle enlist (`.u.upd; tbl; data);
-    .tp.quoteLogHandle enlist (`.u.upd; tbl; data)
-  ];
+  / Skip health updates from logging
+  if[tbl = `health_feed_handler; :()];
+  .tp.logHandle enlist (`.u.upd; tbl; data);
+  .tp.logCount+:1;
   };
 ```
 
@@ -87,25 +86,25 @@ The `health_feed_handler` table is **not logged** because:
 
 **Health data flow:**
 ```
-Trade FH ──┐
-           ├──► TP ──► TEL (subscription only, no logging)
-Quote FH ──┘
+Trade FH ───┐
+            ├──► TP ──► TEL (subscription only, no logging)
+Quote FH ───┘
 ```
 
-### Rationale for Separate Files
+### Rationale for Single File
 
 | Benefit | Description |
 |---------|-------------|
-| Independent replay | Replay trades without quotes or vice versa |
-| Different consumers | Can target specific subscribers |
-| Debugging | Isolate issues to specific data type |
-| Retention | Could have different retention policies |
-| Size management | Trade and quote volumes differ |
+| Temporal consistency | Events replay in exact arrival order |
+| Point-in-time recovery | Stop at message N = consistent state across ALL tables |
+| Standard pattern | Matches canonical `tick.q` behavior |
+| Simpler implementation | One handle, one file, one counter |
+| Cross-table analytics | RTE state is correct during replay |
 
 ### End-of-Day Behaviour
 
-- Log rotation occurs at midnight (new date = new files)
-- `.tp.rotate[]` function closes old handles, opens new
+- Log rotation occurs at midnight (new date = new file)
+- `.tp.rotate[]` function closes old handle, opens new
 - No Historical Database (HDB) implemented
 - Logs are retained for replay/debugging but not persisted to HDB
 
@@ -113,38 +112,39 @@ Quote FH ──┘
 
 | Component | On Restart | Recovery Source |
 |-----------|------------|-----------------|
-| RDB | Starts empty | Replay from trade + quote logs |
-| RTE | State lost | Rebuilds naturally as data arrives |
+| RDB | Starts empty | Replay from log |
+| RTE | State lost | Replay from log (then cleanup) |
 | TEL | State lost | Rebuilds from subscriptions + queries |
 | TP | Logs reset | N/A |
 
 ### Tables and Logging
 
-| Table | Log File | Subscribers | Logged? |
-|-------|----------|-------------|---------|
-| `trade_binance` | `.trade.log` | RDB, RTE | ✅ Yes |
-| `quote_binance` | `.quote.log` | RDB, RTE | ✅ Yes |
-| `health_feed_handler` | N/A | TEL | ❌ No (ephemeral) |
+| Table | Logged? | Subscribers |
+|-------|---------|-------------|
+| `trade_binance` | ✅ Yes | RDB, RTE |
+| `quote_binance` | ✅ Yes | RDB, RTE |
+| `health_feed_handler` | ❌ No (ephemeral) | TEL |
 
-**Note:** Both RDB and RTE subscribe to both trades and quotes (updated 2026-01-06).
+**Note:** Both RDB and RTE subscribe to both trades and quotes.
 
 ## Rationale
 
-Separate log files were selected because:
+A single log file was selected because:
 
-- **Replay flexibility**: Can replay trades without quotes or vice versa
-- **Consumer alignment**: Different components have different data needs
-- **Debugging**: Easier to isolate issues per data type
-- **Future-proof**: Different retention or archival policies possible
-- **Health separation**: Operational metrics don't need durability
+- **Temporal fidelity**: Events replay in true arrival order
+- **Point-in-time recovery**: Can stop at any message for consistent cross-table state
+- **Simpler debugging**: One file to inspect for audit/forensics
+- **Cross-table analytics**: RTE computing on both feeds gets correct state during replay
+- **Standard pattern**: Matches canonical kdb+tick design
 
 ## Alternatives Considered
 
-### 1. Single combined log file
-Rejected:
-- Must replay everything to get anything
-- Larger files to scan
-- Mixed data types complicate debugging
+### 1. Separate log files per table (previous design)
+Rejected (2026-01-09):
+- Breaks chronological order during replay
+- RDB replays all trades, then all quotes (wrong order)
+- RTE state incorrect during replay
+- Complicates point-in-time recovery
 
 ### 2. No logging (original design)
 Updated:
@@ -175,39 +175,35 @@ Rejected:
 
 ### Positive
 
-- Independent replay per data type
-- Cleaner debugging
-- Flexible recovery options
-- Minimal latency impact
-- Simple implementation
+- Correct temporal ordering during replay
+- Point-in-time recovery possible
+- Simpler implementation (one file handle)
+- Matches standard tick.q pattern
+- Cross-table analytics work correctly during replay
 - Health metrics don't pollute logs
 - Clear separation: market data (logged) vs operational data (ephemeral)
 
 ### Negative / Trade-offs
 
-- Two file handles to manage
-- Log rotation must handle both files
-- Slightly more complex than single file
-- No health history across restarts (acceptable)
+- Cannot replay trades without quotes (or vice versa)
+- Single file may be larger
+- No per-table retention policies
 
-These trade-offs are acceptable.
+These trade-offs are acceptable for temporal consistency.
 
 ## Replay Support
 
-Replay tool (`kdb/replay.q`) supports targeting specific log types:
+Replay uses standard `-11!` streaming execute:
 ```bash
-# Replay trades only to RDB
-q kdb/replay.q -logfile logs/2025.12.29.trade.log
+# Replay all data for a date
+q kdb/rdb.q   # Auto-replays on startup
 
-# Replay quotes only to RDB
-q kdb/replay.q -logfile logs/2025.12.29.quote.log
-
-# Replay both (sequential)
-q kdb/replay.q -logfile logs/2025.12.29.trade.log
-q kdb/replay.q -logfile logs/2025.12.29.quote.log
+# Manual replay
+q
+.rdb.replay[2025.12.29]
 ```
 
-**Note:** RTE does not need replay - it rebuilds VWAP/imbalance state naturally as new market data arrives.
+**Note:** RTE also auto-replays on startup, then runs cleanup to keep only the retention window.
 
 ## Links / References
 
@@ -216,4 +212,4 @@ q kdb/replay.q -logfile logs/2025.12.29.quote.log
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` (market data flow)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (health metrics)
 - `adr-006-recovery-and-replay-strategy.md` (replay mechanism)
-- `adr-009-l1-order-book-architecture.md` (quote data source)
+- `adr-009-l5-order-book-architecture.md` (quote data source)

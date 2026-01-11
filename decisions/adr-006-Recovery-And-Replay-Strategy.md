@@ -1,11 +1,11 @@
 # ADR-006: Recovery and Replay Strategy
 
 ## Status
-Accepted (Updated 2026-01-07)
+Accepted (Updated 2026-01-09)
 
 ## Date
 Original: 2025-12-17
-Updated: 2025-12-29, 2026-01-06, 2026-01-07
+Updated: 2025-12-29, 2026-01-06, 2026-01-07, 2026-01-09
 
 ## Context
 
@@ -39,18 +39,19 @@ This project is explicitly **exploratory and incremental** in nature.
 
 ## Decision
 
-The project implements a **production-grade recovery model** with automatic log replay on startup.
+The project implements a **production-grade recovery model** with automatic log replay on startup using a **single log file** that preserves chronological order across all tables.
 
 ### Recovery Capability Summary
 
 | Level | Capability | Status |
 |-------|------------|--------|
-| TP log format | `-11!` compatible binary logs | ✔ Implemented |
-| RDB auto-replay | Automatic replay on startup | ✔ Implemented |
-| RTE auto-replay | Automatic replay on startup | ✔ Implemented |
-| Log management | Cleanup, diagnostics, verification | ✔ Implemented |
+| TP log format | `-11!` compatible binary logs | ✓ Implemented |
+| Single log file | Temporal consistency across tables | ✓ Implemented |
+| RDB auto-replay | Automatic replay on startup | ✓ Implemented |
+| RTE auto-replay | Automatic replay on startup | ✓ Implemented |
+| Log management | Cleanup, diagnostics, verification | ✓ Implemented |
 | FH recovery from Binance | Replay missed data from exchange | ✗ Not available |
-| Gap detection | Identify missed events via sequence numbers | ✔ Available |
+| Gap detection | Identify missed events via sequence numbers | ✓ Available |
 | Gap recovery | Fill gaps with missed data | ✗ Not implemented |
 
 ### Log Format
@@ -69,43 +70,42 @@ The project implements a **production-grade recovery model** with automatic log 
 **Log file structure:**
 - Binary IPC format (serialized q objects)
 - Each entry: `enlist (`.u.upd; tableName; data)`
-- Separate files per data type (see ADR-003):
-  - `logs/YYYY.MM.DD.trade.log` – Trade events (13 fields from TP)
-  - `logs/YYYY.MM.DD.quote.log` – Quote events (29 fields from TP)
+- **Single file per day** containing all market data in arrival order:
+  - `logs/YYYY.MM.DD.log` — All events (trades + quotes interleaved)
 - Daily rotation at midnight
 
 **Log entry format:**
 ```q
-/ Written by TP
-logHandle enlist (`.u.upd; `trade_binance; data)
+/ Written by TP (trades and quotes interleaved chronologically)
+logHandle enlist (`.u.upd; `trade_binance; tradeData)
+logHandle enlist (`.u.upd; `quote_binance; quoteData)
+logHandle enlist (`.u.upd; `trade_binance; tradeData)
+...
 
-/ Replayed by -11! which calls .u.upd for each entry
+/ Replayed by -11! which calls .u.upd for each entry in order
 ```
 
 ### RDB Automatic Recovery
 
 **On RDB startup:**
-1. Check if today's log files exist and have content
-2. If logs exist, replay them using `-11!` streaming execute
+1. Check if today's log file exists and has content
+2. If log exists, replay it using `-11!` streaming execute
 3. Subscribe to TP for live updates
 4. Live data appends to replayed data (no gaps, no duplicates)
 
 ```q
 / RDB replay on startup
 .rdb.replay:{[d]
+  if[d ~ (::); d:.z.D];
   -1 "RDB: Starting replay for ",string[d];
   
-  / Replay trade log
-  tradeLog:.rdb.logFile[d;`trade];
-  tradeChunks:.rdb.replayFile[tradeLog];
+  / Replay single log file (trades + quotes in chronological order)
+  logFile:.rdb.logFile[d];
+  chunks:.rdb.replayFile[logFile];
   
-  / Replay quote log
-  quoteLog:.rdb.logFile[d;`quote];
-  quoteChunks:.rdb.replayFile[quoteLog];
-  
-  total:tradeChunks + quoteChunks;
-  -1 "RDB: Replay complete - ",string[tradeChunks]," trades, ",string[quoteChunks]," quotes";
-  total
+  -1 "RDB: Replay complete - ",string[chunks]," chunks";
+  -1 "RDB: Tables now have ",string[count trade_binance]," trades, ",string[count quote_binance]," quotes";
+  chunks
   };
 
 / Single file replay with error handling
@@ -121,29 +121,33 @@ logHandle enlist (`.u.upd; `trade_binance; data)
 ### RTE Automatic Recovery
 
 **On RTE startup:**
-1. Check if today's log files exist and have content
-2. If logs exist, replay them using `-11!` streaming execute
+1. Check if today's log file exists and has content
+2. If log exists, replay it using `-11!` streaming execute
 3. Run cleanup to remove stale data outside retention window
 4. Subscribe to TP for live updates
 
 ```q
-/ RTE replay on startup (similar to RDB)
+/ RTE replay on startup
 .rte.replay:{[d]
+  if[d ~ (::); d:.z.D];
   -1 "RTE: Starting replay for ",string[d];
   
-  / Replay trade log (for VWAP)
-  tradeChunks:.rte.replayFile[.rte.logFile[d;`trade]];
+  / Replay single log file (trades + quotes in chronological order)
+  logFile:.rte.logFile[d];
+  chunks:.rte.replayFile[logFile];
   
-  / Replay quote log (for imbalance)
-  quoteChunks:.rte.replayFile[.rte.logFile[d;`quote]];
-  
-  total:tradeChunks + quoteChunks;
-  -1 "RTE: Replay complete";
-  total
+  -1 "RTE: Replay complete - ",string[chunks]," chunks";
+  -1 "RTE: VWAP buckets: ",string[count vwapBuckets],", Imbalance symbols: ",string[count .rte.imb.latest];
+  chunks
   };
 ```
 
-**Key difference from RDB:** After replay, RTE runs cleanup to keep only the configured retention window (default 10 minutes). Old VWAP buckets are deleted; only the latest imbalance per symbol is kept.
+**Key benefit of single file:** During replay, trades and quotes arrive in the same order as live operation. This means:
+- VWAP buckets are populated correctly
+- Imbalance state reflects the correct sequence of order book updates
+- Any cross-table analytics produce correct results
+
+**After replay:** RTE runs cleanup to keep only the configured retention window (default 10 minutes). Old VWAP buckets are deleted; only the latest imbalance per symbol is kept.
 
 ### Log Manager (LOG) Process
 
@@ -152,9 +156,9 @@ A dedicated LOG process (port 5014) provides log file management:
 | Function | Description |
 |----------|-------------|
 | `.log.list[]` | List all log files with sizes and chunk counts |
-| `.log.summary[]` | Summary by date (trade/quote chunks, total size) |
+| `.log.summary[]` | Summary by date (chunks, total size) |
 | `.log.verify[file]` | Verify single log file integrity |
-| `.log.verifyDate[date]` | Verify all logs for a date |
+| `.log.verifyDate[date]` | Verify log for a date |
 | `.log.cleanup[days]` | Delete logs older than N days |
 
 See ADR-010 for detailed LOG process specification.
@@ -177,9 +181,9 @@ ADR-001 defines `fhSeqNo` (feed handler sequence number) and `tradeId` (Binance 
 
 | Capability | Status | Mechanism |
 |------------|--------|-----------|
-| Gap detection | ✔ Available | `fhSeqNo` gaps indicate missed FH events |
-| Gap attribution | ✔ Available | Distinguish FH gaps from Binance gaps |
-| Gap reporting | ✔ Available | Observable via telemetry (ADR-005) |
+| Gap detection | ✓ Available | `fhSeqNo` gaps indicate missed FH events |
+| Gap attribution | ✓ Available | Distinguish FH gaps from Binance gaps |
+| Gap reporting | ✓ Available | Observable via telemetry (ADR-005) |
 | Gap recovery | ✗ Not implemented | Gaps from FH downtime are permanent |
 
 ### Data Loss Acceptance
@@ -206,6 +210,12 @@ ADR-001 defines `fhSeqNo` (feed handler sequence number) and `tradeId` (Binance 
 
 This approach was selected because:
 
+**Single log file:**
+- Preserves chronological order across all tables
+- Enables point-in-time recovery with consistent state
+- Matches standard kdb+tick pattern
+- RTE analytics correct during replay
+
 **Automatic replay:**
 - Zero manual intervention on restart
 - Production-grade reliability
@@ -220,54 +230,58 @@ This approach was selected because:
 
 ## Alternatives Considered
 
-### 1. No replay capability (original design)
+### 1. Separate log files per table (previous design)
+Rejected (2026-01-09):
+- Breaks chronological order during replay
+- RDB replays all trades, then all quotes (wrong sequence)
+- RTE state may be incorrect during replay
+- Cannot do point-in-time recovery across tables
+- Complicates debugging (which file had the issue?)
+
+### 2. No replay capability (original design)
 Revised:
 - Data loss on every restart unacceptable
 - Made debugging difficult
 - Required live market for all testing
 
-### 2. Manual replay only
+### 3. Manual replay only
 Rejected:
 - Requires operator intervention
 - Risk of forgetting to replay
 - Automatic is more reliable
 
-### 3. RDB queries for RTE recovery
+### 4. RDB queries for RTE recovery
 Rejected:
 - Adds IPC dependency during startup
 - RDB might not be ready
 - Direct log replay is simpler
 
-### 4. Use Binance REST API for gap fill
+### 5. Use Binance REST API for gap fill
 Rejected:
 - Adds significant complexity
 - REST and WebSocket data may differ
 - Out of scope for current phase
 
-### 5. Full checkpoint/snapshot recovery
+### 6. Full checkpoint/snapshot recovery
 Rejected:
 - Significant implementation effort
 - Replay from log is simpler
 - Log replay is fast enough
-
-### 6. Single combined log file
-Rejected (see ADR-003):
-- Must replay everything to recover anything
-- Mixed data types complicate debugging
-- Can't replay trades without quotes
 
 ## Consequences
 
 ### Positive
 
 - **Zero data loss** on RDB/RTE restart (same day)
+- **Correct temporal ordering** during replay
+- **Point-in-time recovery** possible across all tables
 - Automatic recovery without operator intervention
 - Production-grade reliability
 - Fast startup even with large logs
 - RTE state valid immediately after replay + cleanup
 - LOG process enables retention management
 - Consistent with kdb+tick standard patterns
-- Separate log files allow selective replay
+- Simpler implementation (one file per day)
 
 ### Negative / Trade-offs
 
@@ -275,6 +289,7 @@ Rejected (see ADR-003):
 - Replay doesn't recover gaps from FH downtime
 - Cross-day recovery requires manual intervention
 - LOG process adds another component to manage
+- Cannot replay trades without quotes (or vice versa)
 - RTE analytics may include old data briefly (until cleanup runs)
 
 These trade-offs are acceptable for a production-grade system.
@@ -285,7 +300,7 @@ These trade-offs are acceptable for a production-grade system.
 
 - [x] TP logging with `-11!` compatible format
 - [x] Log file initialization with `set ()`
-- [x] Separate log files per data type (trade, quote)
+- [x] **Single log file** per day (trades + quotes interleaved)
 - [x] Daily log rotation
 - [x] RDB automatic replay on startup
 - [x] RTE automatic replay on startup
@@ -294,6 +309,7 @@ These trade-offs are acceptable for a production-grade system.
 - [x] Log verification functions
 - [x] Log cleanup functions
 - [x] Integration with ctl.q control process
+- [x] Graceful shutdown (SIGTERM before SIGKILL)
 
 ### Future Enhancements
 
@@ -312,7 +328,7 @@ These trade-offs are acceptable for a production-grade system.
 
 - `../kdbx-real-time-architecture-reference.md`
 - `adr-001-timestamps-and-latency-measurement.md` (sequence numbers, timing fields)
-- `adr-003-tickerplant-logging-and-durability-strategy.md` (TP logging, separate files)
+- `adr-003-tickerplant-logging-and-durability-strategy.md` (TP logging, single file)
 - `adr-004-real-time-analytics-computation.md` (RTE bucketed design)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (ephemeral telemetry)
 - `adr-009-l5-order-book-architecture.md` (quote data, L5 depth)

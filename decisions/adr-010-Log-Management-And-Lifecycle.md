@@ -1,20 +1,20 @@
 # ADR-010: Log Management and Lifecycle
 
 ## Status
-Accepted
+Accepted (Updated 2026-01-09)
 
 ## Date
-2026-01-07
+Original: 2026-01-07
+Updated: 2026-01-09
 
 ## Context
 
 The system uses tickerplant (TP) binary logs for durability and recovery (see ADR-003, ADR-006):
-- Trade log: `logs/YYYY.MM.DD.trade.log`
-- Quote log: `logs/YYYY.MM.DD.quote.log`
+- Single log file per day: `logs/YYYY.MM.DD.log`
+- Contains all market data (trades + quotes) in chronological order
 
 As the system runs, log files accumulate:
-- ~35 MB per hour per data type (at current message rates)
-- ~70 MB/hour total
+- ~70 MB per hour (at current message rates)
 - ~1.7 GB/day if running 24 hours
 
 Without management:
@@ -43,8 +43,8 @@ A dedicated **LOG manager process** (port 5014) handles log lifecycle management
                     TP :5010
                        |
                        v
-              logs/*.trade.log
-              logs/*.quote.log
+              logs/YYYY.MM.DD.log
+             (trades + quotes)
                        |
                        v
     +------------------+------------------+
@@ -79,37 +79,42 @@ RDB :5011         RTE :5012          LOG :5014
 ```q
 .log.list[]
 / Returns table:
-/ date       typ   file                          sizeMB   chunks
-/ ----------------------------------------------------------------
-/ 2026.01.06 trade `:logs/2026.01.06.trade.log   64.39    238662
-/ 2026.01.06 quote `:logs/2026.01.06.quote.log   77.58    121078
-/ 2026.01.07 trade `:logs/2026.01.07.trade.log   34.61    243405
-/ 2026.01.07 quote `:logs/2026.01.07.quote.log   35.60    123181
+/ date       file                     sizeMB   chunks
+/ --------------------------------------------------------
+/ 2026.01.06 `:logs/2026.01.06.log    141.97   359740
+/ 2026.01.07 `:logs/2026.01.07.log    70.21    366586
+/ 2026.01.08 `:logs/2026.01.08.log    68.45    358921
 ```
 
 **Summary:**
 ```q
 .log.summary[]
-/ Returns table grouped by date:
-/ date      | tradeChunks quoteChunks totalMB
-/ ----------| --------------------------------
-/ 2026.01.06| 238662      121078      141.97
-/ 2026.01.07| 243405      123181      70.21
+/ Returns table:
+/ chunks   sizeMB
+/ ----------------
+/ 359740   141.97
+/ 366586   70.21
+/ 358921   68.45
 ```
 
 **Verification:**
 ```q
 .log.verifyDate[.z.D]
+/ LOG: Verifying :logs/2026.01.09.log
+/   Chunks: 366586
+/   Size: 70891050 bytes
+/   Valid: 1
 / Returns:
-/ typ   status chunks size
-/ ----------------------------
-/ trade ok     243405 35293733
-/ quote ok     123181 35599317
+/ status| `ok
+/ file  | `:logs/2026.01.09.log
+/ chunks| 366586
+/ size  | 70891050
+/ valid | 1b
 
-.log.verify[`:logs/2026.01.07.trade.log]
-/ LOG: Verifying :logs/2026.01.07.trade.log
-/   Chunks: 243405
-/   Size: 35293733 bytes
+.log.verify[`:logs/2026.01.07.log]
+/ LOG: Verifying :logs/2026.01.07.log
+/   Chunks: 366586
+/   Size: 70891050 bytes
 /   Valid: 1
 ```
 
@@ -117,11 +122,10 @@ RDB :5011         RTE :5012          LOG :5014
 ```q
 .log.cleanup[7]    / Delete logs older than 7 days
 .log.cleanup[]     / Use default retention (7 days)
-/ LOG: Cleaning up logs older than 2025.12.31 (7 day retention)
-/ LOG: Deleting 2 files...
-/   Deleting: :logs/2025.12.30.trade.log
-/   Deleting: :logs/2025.12.30.quote.log
-/ LOG: Cleanup complete - deleted 2 files
+/ LOG: Cleaning up logs older than 2026.01.02 (7 day retention)
+/ LOG: Deleting 1 files...
+/   Deleting: :logs/2025.12.30.log (2025.12.30)
+/ LOG: Cleanup complete - deleted 1 files
 ```
 
 ### Log File Information
@@ -186,7 +190,7 @@ CTL (port 5000) includes LOG in health checks:
 LOG is included in all startup scripts:
 - `start.sh` - tmux window for LOG
 - `start_bg.sh` - background process with PID file
-- `stop.sh` - kills LOG along with other processes
+- `stop.sh` - graceful shutdown (SIGTERM then SIGKILL)
 
 ## Rationale
 
@@ -248,6 +252,13 @@ Deferred:
 - Out of scope for current phase
 - Can be added when HDB is built
 
+### 7. Separate log files per table
+Rejected (2026-01-09):
+- Breaks chronological order during replay
+- Complicates point-in-time recovery
+- Single file is simpler to manage
+- See ADR-003 for full rationale
+
 ## Consequences
 
 ### Positive
@@ -259,6 +270,7 @@ Deferred:
 - Integration with control process
 - No impact on data processing components
 - Safe (manual cleanup by default)
+- Simple file discovery (one file per day)
 
 ### Negative / Trade-offs
 
@@ -287,10 +299,10 @@ These trade-offs are acceptable for the current phase.
 | `kdb/ctl.q` | Control process (includes LOG) |
 | `start.sh` | tmux startup (includes LOG) |
 | `start_bg.sh` | Background startup (includes LOG) |
-| `stop.sh` | Shutdown (includes LOG) |
+| `stop.sh` | Graceful shutdown (includes LOG) |
 
 ## Links / References
 
-- `adr-003-tickerplant-logging-and-durability-strategy.md` (log file format)
+- `adr-003-tickerplant-logging-and-durability-strategy.md` (log file format, single file)
 - `adr-006-recovery-and-replay-strategy.md` (replay mechanism)
 - `kdb/logmgr.q` (implementation)
