@@ -1,11 +1,11 @@
 # ADR-008: Error Handling Strategy
 
 ## Status
-Accepted (Updated 2026-01-06)
+Accepted (Updated 2026-01-11)
 
 ## Date
 Original: 2025-12-18
-Updated: 2026-01-03, 2026-01-06
+Updated: 2026-01-03, 2026-01-06, 2026-01-11
 
 ## Context
 
@@ -14,9 +14,9 @@ The system consists of multiple components communicating via network:
 ```
 Binance Trade Stream ──WebSocket──► Trade FH ──┬──IPC──► TP ──IPC──► RDB
                                                │              ──IPC──► RTE
-Binance Depth Stream ──WebSocket──► Quote FH ──┘
-         ▲
-         └──REST── (snapshot)
+Binance Depth Stream ──WebSocket──► Quote FH ──┘              ──IPC──► TEL
+         ▲                                                         │
+         └──REST── (snapshot)                          queries ────┴──► RDB, RTE
 ```
 
 Each component can experience failures:
@@ -70,10 +70,12 @@ These are distinct concepts:
 | Concept | Meaning | Status |
 |---------|---------|--------|
 | **Independent restart** | Can restart one process without restarting others | ✓ Supported |
-| **Auto-reconnection (FH)** | Feed handler automatically reconnects to Binance/TP | ✓ Implemented |
-| **Auto-reconnection (q)** | kdb+ processes reconnect to TP | Minimal (manual restart) |
+| **Auto-reconnection (FH→Binance)** | Feed handler reconnects to Binance WebSocket | ✓ Implemented |
+| **Auto-reconnection (FH→TP)** | Feed handler reconnects to TP | ✓ Implemented |
+| **Auto-reconnection (q→TP)** | kdb+ processes reconnect to TP subscription | Manual restart required |
+| **Auto-reconnection (TEL→RDB/RTE)** | TEL query handles reconnect on failure | ✓ Implemented (ADR-005) |
 
-Independent restart is a benefit of the separate-process architecture (ADR-002). Auto-reconnection in feed handlers is implemented with exponential backoff.
+Independent restart is a benefit of the separate-process architecture (ADR-002). Auto-reconnection in feed handlers is implemented with exponential backoff. TEL maintains persistent IPC handles to RDB/RTE that automatically reconnect on query failure (see ADR-005).
 
 ### Error Categories
 
@@ -515,7 +517,7 @@ These trade-offs are acceptable for the current phase.
 - [x] Quote FH: OrderBookManager with per-symbol state tracking
 - [x] TP: `.z.pc` handles subscriber disconnect
 - [x] TP: `.u.sub` validates table name
-- [x] TP: Logging to separate files per data type
+- [x] TP: Logging to single file per day (trades + quotes)
 - [x] RDB: Protected TP connection with error message
 - [x] RDB: Subscription to both trades and quotes
 - [x] RTE: Protected TP connection with error message

@@ -50,7 +50,7 @@ Real-time analytics will be computed in a **Real-Time Engine (RTE)** process usi
 |--------|----------|--------|-------------|
 | VWAP | Time-bucketed aggregation | 1-10 min | Hot (every trade) |
 | Order Book Imbalance | Latest + EMA smoothing | Point-in-time | Hot (every quote) |
-| OBI History | Rolling table | 5-7 min | Hot (every quote) |
+| OBI History | Rolling table | 7 min | Hot (every quote) |
 | L5 Order Book | Latest snapshot | Point-in-time | Hot (every quote) |
 | Variance-Covariance | Resampled calculation | 1 hour | Cold (timer, 5s) |
 
@@ -468,7 +468,7 @@ SOLUSDT 31.69         67.00      below
 | tradeBuckets | Keyed table | ~400KB (65min × 3sym) | O(1) upsert | Timer (5s) |
 | .rte.imb.latest | Dictionary | ~300 bytes | O(1) | None |
 | .rte.imb.ema | Dictionary | ~100 bytes | O(1) | None |
-| .rte.imb.history | Table | ~2MB (5min) | O(1) append | Timer (5s) |
+| .rte.imb.history | Table | ~2MB (7min) | O(1) append | Timer (5s) |
 | .rte.book.latest | Dictionary | ~500 bytes | O(1) | None |
 | .rte.vcov.latest | Dictionary | ~1KB | Timer (5s) | None |
 | .rte.vcov.history | Table | ~50KB (15min) | Timer (5s) | Timer (5s) |
@@ -514,7 +514,7 @@ The RTE timer runs every 5 seconds:
   .rte.bucket.cleanup[];      / Remove old trade buckets (> 65 min)
   .rte.vcov.update[];         / Recalculate var-covar matrix
   .rte.vcov.cleanup[];        / Remove old vcov history (> 15 min)
-  .rte.imb.cleanup[];         / Remove old OBI history (> 5 min)
+  .rte.imb.cleanup[];         / Remove old OBI history (> 7 min)
   };
 ```
 
@@ -565,7 +565,7 @@ On RTE restart:
 | Component | Memory | Notes |
 |-----------|--------|-------|
 | Trade buckets | ~400KB | 65min × 60sec × 3sym × ~100 bytes |
-| OBI history | ~2MB | 5min of quote imbalances |
+| OBI history | ~2MB | 7min of quote imbalances |
 | Vcov history | ~50KB | 15min of matrix snapshots |
 | Snapshots | ~2KB | Order book, imbalance latest |
 | **Total** | **~3MB** | Scales linearly with symbols |
@@ -657,7 +657,7 @@ Rejected:
 
 - VWAP state must rebuild after restart (~5 minutes)
 - Var-covar needs warm-up (~50 minutes for valid)
-- OBI history limited to 5 minutes
+- OBI history limited to 7 minutes
 - Bucketing introduces slight precision loss
 
 ---
@@ -681,4 +681,4 @@ Rejected:
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (ephemeral stance)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (latency tracking moved here)
 - `adr-007-visualisation-and-consumption-strategy.md` (dashboard consumption)
-- `adr-009-L1-Order-Book-Architecture.md` (quote feed handler details)
+- `adr-009-L5-Order-Book-Architecture.md` (quote feed handler details)

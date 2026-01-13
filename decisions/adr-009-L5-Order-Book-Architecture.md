@@ -1,11 +1,11 @@
 # ADR-009: L5 Order Book Architecture
 
 ## Status
-Accepted (Updated 2026-01-06)
+Accepted (Updated 2026-01-11)
 
 ## Date
 Original: 2025-12-29
-Updated: 2026-01-03, 2026-01-06
+Updated: 2026-01-03, 2026-01-06, 2026-01-11
 
 ## Context
 
@@ -30,6 +30,8 @@ A decision is required on how to implement order book ingestion with correct rec
 **Update (2026-01-03):** Extended from L1 (best bid/ask only) to L5 (5 levels of depth) to enable richer analytics including multi-level order book imbalance.
 
 **Update (2026-01-06):** Added timing measurements (`fhParseUs`, `fhSendUs`) for latency analysis consistent with trade feed handler (see ADR-001).
+
+**Update (2026-01-11):** Corrected logging section to align with ADR-003 (single log file per day).
 
 ## Notation
 
@@ -218,14 +220,13 @@ See `docs/specs/quotes-schema.md` for full schema specification.
 
 ### Logging
 
-Separate log files per ADR-003:
-- Trade log: `logs/YYYY.MM.DD.trade.log`
-- Quote log: `logs/YYYY.MM.DD.quote.log`
+Single log file per day per ADR-003:
+- Combined log: `logs/YYYY.MM.DD.log` (contains both trades and quotes)
 
 Rationale:
-- Independent replay
-- Cleaner debugging
-- Different retention policies possible
+- Consistent with ADR-003 ephemeral logging stance
+- Single log simplifies tickerplant operation
+- Replay processes both tables together
 
 ### REST Client
 
@@ -330,7 +331,6 @@ Updated:
 - Clear state machine for debugging
 - Cache-efficient flat-array design
 - L5 depth enables imbalance analytics
-- Separate logs for independent analysis
 - Timing measurements enable performance analysis
 - Consistent instrumentation with trade handler
 - Per-event timing simpler than separate telemetry
@@ -419,9 +419,8 @@ These measurements validate:
 - `../api-binance.md` (depth stream specification)
 - `adr-001-timestamps-and-latency-measurement.md` (timing measurement specification)
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` (ingestion architecture)
-- `adr-003-tickerplant-logging-and-durability-strategy.md` (separate log files)
+- `adr-003-tickerplant-logging-and-durability-strategy.md` (single log file per day)
 - `adr-004-real-time-analytics-computation.md` (RTE imbalance)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (timing aggregation)
 - `adr-008-error-handling-strategy.md` (reconnect, error handling)
 - `docs/specs/quotes-schema.md` (full schema specification)
-

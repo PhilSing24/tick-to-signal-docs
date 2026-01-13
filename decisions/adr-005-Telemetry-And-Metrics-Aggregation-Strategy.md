@@ -128,7 +128,7 @@ Rationale:
 ```
 Trade FH ---> TP :5010 --+--> RDB :5011 (trade_binance, quote_binance)
 Quote FH -------^        |
-                         +--> RTE :5012 (vwapBuckets, .rte.imb.latest)
+                         +--> RTE :5012 (tradeBuckets, .rte.imb.latest)
                          |
                          +--> TEL :5013 (health_feed_handler subscription)
                                   |

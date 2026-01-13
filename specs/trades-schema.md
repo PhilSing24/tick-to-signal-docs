@@ -196,8 +196,9 @@ This provides both granular debugging and efficient dashboarding.
 The RTE computes VWAP (Volume-Weighted Average Price) from trade data using time-bucketed aggregation:
 
 ```q
-/ Time-bucketed VWAP (1-second buckets)
-vwapBuckets:([]
+/ Time-bucketed trade data (1-second buckets)
+/ Shared foundation for VWAP and Variance-Covariance
+tradeBuckets:([]
   sym:`symbol$();
   bucket:`timestamp$();
   sumPxQty:`float$();   / Σ(price × qty)
@@ -213,7 +214,7 @@ See ADR-004 for RTE analytics details.
 
 ## Log Replay
 
-Trade data is logged by TP to `logs/YYYY.MM.DD.trade.log` in `-11!` compatible format. On RDB restart, trades are automatically replayed:
+Trade data is logged by TP to `logs/YYYY.MM.DD.log` (single file containing all market data) in `-11!` compatible format. On RDB restart, trades are automatically replayed:
 
 ```q
 / Automatic replay on RDB startup
@@ -230,6 +231,7 @@ See ADR-006 for recovery and replay details.
 | 2.0 | 2025-12-18 | Extended to 14 fields with full instrumentation |
 | 2.1 | 2026-01-03 | Added RTE VWAP reference |
 | 2.2 | 2026-01-07 | Added log replay reference, TEL process reference |
+| 2.3 | 2026-01-11 | Renamed vwapBuckets to tradeBuckets, fixed log file reference |
 
 ## References
 

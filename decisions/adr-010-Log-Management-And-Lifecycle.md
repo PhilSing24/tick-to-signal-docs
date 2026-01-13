@@ -1,11 +1,11 @@
 # ADR-010: Log Management and Lifecycle
 
 ## Status
-Accepted (Updated 2026-01-09)
+Accepted (Updated 2026-01-11)
 
 ## Date
 Original: 2026-01-07
-Updated: 2026-01-09
+Updated: 2026-01-09, 2026-01-11
 
 ## Context
 
@@ -47,11 +47,11 @@ A dedicated **LOG manager process** (port 5014) handles log lifecycle management
              (trades + quotes)
                        |
                        v
-    +------------------+------------------+
-    |                  |                  |
-    v                  v                  v
-RDB :5011         RTE :5012          LOG :5014
-(replay)          (replay)           (management)
+    +------------------+------------------+------------------+
+    |                  |                  |                  |
+    v                  v                  v                  v
+RDB :5011         RTE :5012          TEL :5013          LOG :5014
+(replay)          (replay)           (health sub)       (management)
 ```
 
 ### LOG Process Responsibilities

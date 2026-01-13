@@ -1,11 +1,11 @@
 # ADR-006: Recovery and Replay Strategy
 
 ## Status
-Accepted (Updated 2026-01-09)
+Accepted (Updated 2026-01-11)
 
 ## Date
 Original: 2025-12-17
-Updated: 2025-12-29, 2026-01-06, 2026-01-07, 2026-01-09
+Updated: 2025-12-29, 2026-01-06, 2026-01-07, 2026-01-09, 2026-01-11
 
 ## Context
 
@@ -137,7 +137,7 @@ logHandle enlist (`.u.upd; `trade_binance; tradeData)
   chunks:.rte.replayFile[logFile];
   
   -1 "RTE: Replay complete - ",string[chunks]," chunks";
-  -1 "RTE: VWAP buckets: ",string[count vwapBuckets],", Imbalance symbols: ",string[count .rte.imb.latest];
+  -1 "RTE: Trade buckets: ",string[count tradeBuckets],", Imbalance symbols: ",string[count .rte.imb.latest];
   chunks
   };
 ```
