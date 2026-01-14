@@ -60,9 +60,9 @@ The documentation in this repository is structured for AI-assisted exploration. 
 To create an AI assistant that understands this system:
 
 1. Go to [claude.ai](https://claude.ai) → **Projects** → **New Project**
-2. Download all files from this repository
-3. Upload them to **Project Knowledge**
-4. Add the custom instructions below
+2. Create a personal project (Name and describe your project)
+3. Fill Instructions
+4. Add files from Github
 5. Start asking questions
 
 
