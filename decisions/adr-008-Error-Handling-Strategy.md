@@ -1,11 +1,11 @@
 # ADR-008: Error Handling Strategy
 
 ## Status
-Accepted (Updated 2026-01-11)
+Accepted (Updated 2026-01-14)
 
 ## Date
 Original: 2025-12-18
-Updated: 2026-01-03, 2026-01-06, 2026-01-11
+Updated: 2026-01-03, 2026-01-06, 2026-01-11, 2026-01-14
 
 ## Context
 
@@ -264,19 +264,63 @@ if (!snapshot.success) {
 |-------|----------|----------|----------------|
 | Cannot connect to TP | Fatal | Log, exit | `hopen` fails, exit |
 | TP connection lost | Connection | Log, process continues | Subscription lost |
-| Query error (RDB/RTE) | Transient | Log, skip bucket | `.tel.safeQuery` wrapper |
+| Query error (RDB/RTE) | Transient | Log, mark handle invalid, retry next cycle | `.tel.safeQuery` with persistent handles |
 | Timer error | Transient | Log, skip bucket | Protected timer callback |
 
-**Safe query wrapper:**
+**Persistent handle management (see ADR-005):**
 ```q
+/ Handle dictionary: port -> handle (0N = not connected)
+.tel.h:(`int$())!`int$();
+
+/ Get or create persistent handle to a port
+/ Uses lazy connection - only connects when needed
+.tel.getH:{[p]
+  / Return existing valid handle
+  if[.tel.hasValidH[p]; :.tel.h[p]];
+  
+  / Attempt connection with error handling
+  h:@[hopen; `$"::",string p; {[port;err] 
+    -1 "TEL: Failed to connect to port ",string[port]," - ",err; 
+    0N
+    }[p]];
+  
+  / Store result (valid handle or 0N)
+  .tel.h[p]:h;
+  
+  / Log successful connection
+  if[not null h; -1 "TEL: Connected to port ",string[p]," (handle ",string[h],")"];
+  
+  h
+  };
+
+/ Safe query using persistent handles
+/ Automatically marks handle invalid on error for reconnection on next call
 .tel.safeQuery:{[port;query]
-  h:@[hopen; `$"::",string port; {-1 "Cannot connect: ",x; 0N}];
+  / Get or establish connection
+  h:.tel.getH[port];
   if[null h; :()];
-  result:@[h; query; {-1 "Query error: ",x; ()}];
-  hclose h;
-  result
+  
+  / Execute query with error trapping
+  res:@[h; query; {[p;q;err] 
+    / Log the error with context
+    -1 "TEL: Query failed on port ",string[p]," - ",err;
+    / Mark handle as invalid for reconnection on next call
+    .tel.h[p]:0N;
+    `..tel.queryError
+    }[port;query]];
+  
+  / Return empty on error (sentinel value check)
+  if[res ~ `..tel.queryError; :()];
+  
+  res
   };
 ```
+
+**Benefits of persistent handles:**
+- Eliminates TCP handshake overhead per query cycle
+- Automatic reconnection on next query after failure
+- Handle status visible via `.tel.handleStatus[]`
+- Graceful cleanup on shutdown via `.z.exit`
 
 ### Logging Strategy
 
@@ -334,7 +378,7 @@ if (!snapshot.success) {
 | Quote book state machine | ✓ Implemented | `OrderBookManager` with INIT/SYNCING/VALID/INVALID |
 | Health metrics publishing | ✓ Implemented | Both FHs publish every 5 seconds |
 | TP subscriber disconnect | ✓ Implemented | `.z.pc` handler |
-| Protected queries (TEL) | ✓ Implemented | `.tel.safeQuery` wrapper |
+| TEL persistent handles | ✓ Implemented | `.tel.getH`, `.tel.safeQuery` with auto-reconnect |
 
 ### What Is NOT Implemented
 
@@ -364,6 +408,7 @@ Errors are made visible through:
 | Quote validity | `isValid` in `quote_binance` indicates L5 book state | OrderBookManager |
 | Health metrics | FH uptime, message counts, connection state | `health_feed_handler` table |
 | Process exit | Fatal errors surface immediately | Exit codes |
+| Handle status | TEL connection state visible | `.tel.handleStatus[]` |
 
 ### Startup Validation
 
@@ -431,6 +476,7 @@ This approach was selected because:
 - **Debuggable**: Clear, timestamped logs aid understanding
 - **Independent**: Each process handles its own errors
 - **Configurable**: JSON configs allow easy adjustment without recompilation
+- **Efficient**: TEL persistent handles minimize IPC overhead (ADR-005)
 
 ## Alternatives Considered
 
@@ -470,6 +516,13 @@ Rejected:
 - Dashboard provides sufficient visibility
 - No external monitoring system to consume
 
+### 7. Open/close IPC connections each query cycle (TEL)
+Rejected (2026-01-07):
+- 4 TCP handshakes per 5-second tick
+- Unnecessary overhead (~4-12ms per tick)
+- File descriptor churn
+- Persistent handles are simple and more efficient
+
 ## Consequences
 
 ### Positive
@@ -484,6 +537,7 @@ Rejected:
 - spdlog provides production-quality observability
 - Consistent error handling patterns across C++ components
 - Health metrics provide operational visibility
+- TEL persistent handles eliminate connection overhead
 
 ### Negative / Trade-offs
 
@@ -494,6 +548,7 @@ Rejected:
 - spdlog dependency (acceptable - industry standard)
 - JSON config dependency (rapidjson already used)
 - Reconnection adds slight complexity to FH code
+- Persistent handles require explicit management (close on shutdown)
 
 These trade-offs are acceptable for the current phase.
 
@@ -522,14 +577,17 @@ These trade-offs are acceptable for the current phase.
 - [x] RDB: Subscription to both trades and quotes
 - [x] RTE: Protected TP connection with error message
 - [x] RTE: Auto-initialize unknown symbols (VWAP + imbalance)
-- [x] TEL: Protected queries with `.tel.safeQuery`
+- [x] TEL: Persistent handles with `.tel.getH`, `.tel.safeQuery`
+- [x] TEL: Automatic reconnection on query failure
+- [x] TEL: Handle status via `.tel.handleStatus[]`
+- [x] TEL: Graceful shutdown via `.z.exit`
 - [x] TEL: Subscription to health data
 
 ### Recommended Enhancements
 
 - [ ] RDB: Automatic reconnect to TP
 - [ ] RTE: Automatic reconnect to TP
-- [ ] TEL: Automatic reconnect to TP
+- [ ] TEL: Automatic reconnect to TP (subscription)
 - [ ] All q: Protected timer callbacks consistently
 - [ ] All q: Structured logging (explore log4q or similar)
 - [ ] FH: Configurable health publish interval
@@ -563,7 +621,7 @@ These trade-offs are acceptable for the current phase.
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` (separate processes, independent restart)
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (TP logging)
 - `adr-004-real-time-analytics-computation.md` (RTE natural rebuild)
-- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (health metrics, safe queries)
+- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (health metrics, persistent handles)
 - `adr-006-recovery-and-replay-strategy.md` (manual replay)
 - `adr-007-visualisation-and-consumption-strategy.md` (observability via dashboard)
 - `adr-009-order-book-architecture.md` (quote handler state machine, OrderBookManager)
@@ -571,4 +629,6 @@ These trade-offs are acceptable for the current phase.
 - `cpp/include/logger.hpp` (spdlog wrapper)
 - `cpp/src/trade_feed_handler.cpp` (implementation)
 - `cpp/src/quote_feed_handler.cpp` (implementation)
+- `kdb/tel.q` (persistent handle implementation)
+
 

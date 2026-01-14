@@ -1,16 +1,16 @@
 # ADR-007: Visualisation and Consumption Strategy
 
 ## Status
-Accepted (Updated 2025-12-19)
+Accepted (Updated 2026-01-14)
 
 ## Date
-2025-12-17 (Updated 2025-12-19)
+2025-12-17 (Updated 2025-12-19, 2026-01-14)
 
 ## Context
 
 The system produces:
-- Real-time market data (Binance trades)
-- Derived analytics (rolling average price, trade count)
+- Real-time market data (Binance trades and quotes)
+- Derived analytics (VWAP, order book imbalance, variance-covariance)
 - Telemetry and latency metrics
 
 These outputs must be:
@@ -91,24 +91,27 @@ Rationale:
 Dashboards query **RDB, RTE, and TEL**:
 
 ```
-              +---> RDB :5011 (raw trades)
+              +---> RDB :5011 (raw trades, quotes)
               |
-Dashboard ----+---> RTE :5012 (rolling analytics)
+Dashboard ----+---> RTE :5012 (VWAP, imbalance, var-covar, analytics validity)
               |
-              +---> TEL :5013 (telemetry)
+              +---> TEL :5013 (latency telemetry, FH health, system metrics)
 ```
 
 | Data | Source | Port | Table/Query |
 |------|--------|------|-------------|
 | Last trade price | RDB | 5011 | `trade_binance` |
 | Raw trade history | RDB | 5011 | `trade_binance` |
-| Rolling average price | RTE | 5012 | `rollAnalytics` |
-| Rolling trade count | RTE | 5012 | `rollAnalytics` |
-| Analytics validity | RTE | 5012 | `rollAnalytics` |
+| L5 order book | RTE | 5012 | `.rte.getOrderBook[]` |
+| Rolling VWAP | RTE | 5012 | `.rte.getVwap[]` |
+| Order book imbalance | RTE | 5012 | `.rte.getImbalanceAll[]` |
+| Variance-covariance | RTE | 5012 | `.rte.getCorrelationTable[]` |
+| Analytics validity | RTE | 5012 | `.rte.getVwap[]`, `.rte.getVcov[]` (return `isValid`) |
 | FH latency metrics | TEL | 5013 | `telemetry_latency_fh` |
 | E2E latency metrics | TEL | 5013 | `telemetry_latency_e2e` |
-| Throughput metrics | TEL | 5013 | `telemetry_throughput` |
-| Analytics health | TEL | 5013 | `telemetry_analytics_health` |
+| FH health status | TEL | 5013 | `.tel.vsFhStatus[]` |
+| System memory | TEL | 5013 | `.tel.vsSystemResources[]` |
+| Throughput | TEL | 5013 | Derived from `telemetry_latency_fh.cnt / 5` |
 
 **Trade-off acknowledged:** The reference architecture recommends:
 > "Processes accessed by users should be isolated from those performing core system calculations to improve stability and resource control."
@@ -124,10 +127,12 @@ Three dashboards are defined:
 | Panel | Data Source | Content | Update |
 |-------|-------------|---------|--------|
 | Last Price | RDB | Most recent trade price per symbol | 1 sec |
-| Rolling Avg Price | RTE | `avgPrice5m` from `rollAnalytics` | 1 sec |
-| Trade Count | RTE | `tradeCount5m` from `rollAnalytics` | 1 sec |
+| Rolling Avg Price | RTE | `avgPrice` from `.rte.getVwap[]` | 1 sec |
+| Trade Count | RTE | `tradeCount` from `.rte.getVwap[]` | 1 sec |
 | Price Chart | RDB | Time series of recent prices (last 5 min) | 1 sec |
-| Validity Indicator | RTE | `isValid`, `fillPct` display | 1 sec |
+| VWAP Validity | RTE | `isValid` from `.rte.getVwap[]` | 1 sec |
+| Order Book | RTE | `.rte.getOrderBook[]` | 1 sec |
+| OBI Indicator | RTE | `.rte.getImbalanceAll[]` | 1 sec |
 
 **Dashboard 2: Latency Monitor**
 
@@ -137,14 +142,16 @@ Three dashboards are defined:
 | FH Send Latency | TEL | p50/p95/max from `telemetry_latency_fh` | 1 sec |
 | E2E Latency | TEL | p50/p95/max from `telemetry_latency_e2e` | 1 sec |
 | Latency Time Series | TEL | Rolling chart of percentiles (last 5 min) | 1 sec |
-| Throughput Chart | TEL | Events/sec from `telemetry_throughput` | 1 sec |
+| Throughput Chart | TEL | `cnt / 5` from `telemetry_latency_fh` (events/sec) | 1 sec |
 
 **Dashboard 3: System Health**
 
 | Panel | Data Source | Content | Update |
 |-------|-------------|---------|--------|
-| Analytics Health | TEL | Status from `telemetry_analytics_health` | 1 sec |
-| Last Update Time | RDB/RTE | Freshness indicator per component | 1 sec |
+| FH Health Grid | TEL | `.tel.vsFhStatus[]` | 1 sec |
+| System Memory | TEL | `.tel.vsSystemResources[]` | 1 sec |
+| Data Volume | TEL | `.tel.vsDataVolume[]` | 1 sec |
+| Analytics Validity | RTE | `isValid` from `.rte.getVwap[]`, `.rte.getVcov[]` | 1 sec |
 | Data Freshness | RDB | Time since last trade per symbol | 1 sec |
 | Gap Indicator | RDB | Detected `fhSeqNo` gaps (if any) | 1 sec |
 
@@ -155,12 +162,12 @@ Analytics validity (from ADR-004) is displayed using visual indicators:
 | Condition | Display |
 |-----------|---------|
 | `isValid = true` | Green indicator; normal value display |
-| `isValid = false`, `fillPct > 50%` | Yellow indicator; value shown with warning |
-| `isValid = false`, `fillPct <= 50%` | Red indicator; value greyed out or hidden |
+| `isValid = false`, partial data | Yellow indicator; value shown with warning |
+| `isValid = false`, insufficient data | Red indicator; value greyed out or hidden |
 
 Additionally:
-- `fillPct` shown as percentage or progress bar
-- `windowStart` shown to indicate data coverage
+- VWAP shows `tradeCount` to indicate sample size
+- Var-covar shows `buckets` count to indicate data coverage
 - Tooltip explains validity meaning on hover
 
 ### Update Latency Expectations
@@ -218,6 +225,7 @@ They are **not** intended as:
 Initial dashboards display data for:
 - BTCUSDT
 - ETHUSDT
+- SOLUSDT
 
 Each symbol has dedicated panels or can be filtered via dashboard controls.
 
@@ -281,6 +289,18 @@ Rejected:
 - Delays in observing system behaviour
 - 1-second provides better responsiveness for RDB/RTE data
 
+### 8. Separate throughput table in TEL
+Rejected:
+- Throughput is trivially derived from existing `cnt` field
+- No need for redundant storage
+- `events_per_sec = cnt / 5`
+
+### 9. Separate analytics health table in TEL
+Rejected:
+- RTE already exposes validity via query functions
+- Dashboard already queries RTE for analytics data
+- No duplication needed
+
 ## Consequences
 
 ### Positive
@@ -291,6 +311,7 @@ Rejected:
 - Minimal infrastructure requirements
 - Validity indicators aid interpretation
 - Simple polling model easy to debug
+- No redundant tables (throughput derived, analytics health from RTE)
 
 ### Negative / Trade-offs
 
@@ -300,6 +321,7 @@ Rejected:
 - Direct queries mix user and system load
 - No alerting capability (human must observe)
 - Telemetry has 5-second delay due to bucket size
+- Dashboard must query both TEL and RTE for complete health picture
 
 These trade-offs are acceptable for the current phase.
 

@@ -1,11 +1,11 @@
 # ADR-005: Telemetry and Metrics Aggregation Strategy
 
 ## Status
-Accepted (Updated 2026-01-07)
+Accepted (Updated 2026-01-14)
 
 ## Date
 Original: 2025-12-17
-Updated: 2026-01-05, 2026-01-06, 2026-01-07
+Updated: 2026-01-05, 2026-01-06, 2026-01-07, 2026-01-14
 
 ## Context
 
@@ -91,9 +91,8 @@ TEL queries RDB and RTE every 5 seconds for telemetry data. To minimize overhead
 | Category | Metrics | Source |
 |----------|---------|--------|
 | FH segment latencies | `fhParseUs`, `fhSendUs` per handler | Per-event fields from FH (via RDB query) |
-| Pipeline latencies | `fh_to_tp_ms`, `tp_to_rdb_ms`, `e2e_system_ms` | Derived from wall-clock timestamps (via RDB query, trades only) |
-| Throughput | Events per second, per symbol, per handler | Computed from event counts (via RDB query) |
-| Analytics health | VWAP bucket counts, order book imbalance | Queried from RTE |
+| Pipeline latencies | `fh_to_tp_ms`, `tp_to_rdb_ms`, `e2e_system_ms` | Derived from wall-clock timestamps (via RDB query, trades and quotes) |
+| Throughput | Events per second, per symbol, per handler | Derived from `cnt` field in latency tables |
 | FH health | `uptimeSec`, `msgsReceived`, `connState` per handler | Published by FH → TP → TEL (subscription) |
 | System metrics | Memory usage per process | Queried from RDB, RTE, captured from TEL |
 
@@ -136,7 +135,7 @@ Quote FH -------^        |
                                   +-- queries RTE via persistent handle
                                   |
                                   +-- telemetry_latency_fh (unified: trade + quote)
-                                  +-- telemetry_latency_e2e (trades only)
+                                  +-- telemetry_latency_e2e (trades and quotes)
                                   +-- telemetry_system (RDB, RTE, TEL memory)
                                   +-- health_feed_handler (from TP subscription)
 ```
@@ -181,6 +180,7 @@ Quote FH -------^        |
 |--------|------|-------------|
 | `bucket` | timestamp | Start of 5-second bucket |
 | `sym` | symbol | Instrument symbol |
+| `handler` | symbol | Handler type (`trade_fh` or `quote_fh`) |
 | `fhToTpMs_p50` | float | Median FH to TP latency (ms) |
 | `fhToTpMs_p95` | float | 95th percentile FH to TP latency |
 | `fhToTpMs_max` | float | Maximum FH to TP latency |
@@ -200,6 +200,7 @@ Quote FH -------^        |
 | `component` | symbol | Process name (`RDB`, `RTE`, `TEL`) |
 | `heapMB` | float | Heap size (megabytes) |
 | `usedMB` | float | Memory used (megabytes) |
+| `peakMB` | float | Peak memory (megabytes) |
 
 ### Feed Handler Health (via TP Subscription)
 
@@ -244,6 +245,46 @@ TEL provides handle status for debugging:
 / 5012  9      connected
 ```
 
+### Dashboard View Functions
+
+TEL provides pre-formatted view functions for dashboard consumption:
+
+| Function | Description |
+|----------|-------------|
+| `.tel.vsFhStatus[]` | Feed handler status grid (formatted) |
+| `.tel.vsSystemResources[]` | System memory per component |
+| `.tel.vsDataVolume[]` | Trade/quote counts per symbol |
+| `.tel.fhStatusTable[]` | Raw feed handler health with computed fields |
+
+### Throughput Derivation
+
+Throughput (events per second) is derived from the `cnt` field in latency tables:
+
+```q
+/ Events per second = cnt / bucket_size
+/ Example: 250 events in 5-second bucket = 50 events/sec
+eventsPerSec: cnt % 5
+```
+
+No separate `telemetry_throughput` table is needed — throughput is calculated from existing data.
+
+### Analytics Health
+
+Analytics validity is queried directly from RTE rather than stored in TEL:
+
+```q
+/ Query RTE for VWAP validity
+.rte.getVwap[`BTCUSDT; 5]  / Returns isValid field
+
+/ Query RTE for var-covar validity  
+.rte.getVcov[]  / Returns isValid field
+
+/ Query RTE for order book imbalance
+.rte.getImbalance[`BTCUSDT]  / Returns current state
+```
+
+Dashboards query RTE directly for analytics health indicators.
+
 ## Rationale
 
 This approach was selected because it:
@@ -261,6 +302,8 @@ This approach was selected because it:
 - Uses 5-second buckets for stable percentiles with sufficient samples
 - Unified handler table enables performance comparison
 - Handler column provides flexibility for future handler types
+- Derives throughput from existing data (no redundant tables)
+- Queries RTE directly for analytics health (no duplication)
 
 ## Alternatives Considered
 
@@ -283,12 +326,24 @@ Rejected:
 - Reduces flexibility (aggregation logic in compiled code)
 - Loses raw per-event data for debugging
 
+### 4. Separate throughput table
+Rejected:
+- Redundant — throughput is trivially derived from `cnt` field
+- Adds table maintenance overhead
+- No additional value
+
+### 5. Separate analytics health table in TEL
+Rejected:
+- Would require TEL to query RTE for validity flags
+- Duplicates data already available in RTE
+- Dashboard already queries RTE for analytics data
+
 ## Consequences
 
 ### Positive
 
 - Clean separation of concerns (RDB stores market data, RTE computes analytics, TEL handles all monitoring)
-- TEL is single source of truth for monitoring (dashboards query one endpoint)
+- TEL is single source of truth for monitoring (dashboards query one endpoint for telemetry)
 - **Persistent handles eliminate connection overhead** (2026-01-07)
 - Automatic reconnection on connection loss
 - Health uses consistent pub/sub pattern (FH → TP → TEL)
@@ -299,6 +354,8 @@ Rejected:
 - SLO metrics directly queryable
 - 5-second buckets provide stable percentiles
 - Unified handler table enables performance comparison
+- E2E latency tracked for both trades and quotes
+- No redundant tables (throughput derived, analytics health queried)
 
 ### Negative / Trade-offs
 
@@ -308,8 +365,8 @@ Rejected:
 - No historical trend analysis
 - 15-minute bucket retention limits lookback
 - Handler comparison requires filtering on `handler` column
-- Quote E2E latency not tracked (acceptable trade-off)
 - Persistent handles require explicit management (close on shutdown)
+- Analytics health requires dashboard to query RTE directly
 
 These trade-offs are acceptable for the current phase.
 

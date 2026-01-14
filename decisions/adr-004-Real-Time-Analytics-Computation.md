@@ -322,7 +322,7 @@ smOBI = α × OBI + (1 - α) × prevSmOBI
 ```q
 .rte.cfg.obiAlpha:0.05;          / EMA smoothing factor (lower = smoother)
 .rte.cfg.obiThreshold:0.3;       / Threshold for buyer/seller pressure
-.rte.cfg.obiRetentionMin:5;      / Keep 5 minutes of history
+.rte.cfg.obiRetentionMin:7;      / Keep 7 minutes of history
 ```
 
 **Pressure Classification:**

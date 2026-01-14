@@ -93,7 +93,7 @@ wss://stream.binance.com:9443/stream?streams=<streamName1>/<streamName2>/<stream
 
 **Example (multiple streams):**
 ```
-wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade
+wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade
 ```
 
 Combined stream messages are wrapped in an envelope:
@@ -128,7 +128,8 @@ Streams can be subscribed/unsubscribed dynamically via WebSocket messages.
   "method": "SUBSCRIBE",
   "params": [
     "btcusdt@trade",
-    "ethusdt@trade"
+    "ethusdt@trade",
+    "solusdt@trade"
   ],
   "id": 1
 }
@@ -179,7 +180,8 @@ Streams can be subscribed/unsubscribed dynamically via WebSocket messages.
 {
   "result": [
     "btcusdt@trade",
-    "ethusdt@trade"
+    "ethusdt@trade",
+    "solusdt@trade"
   ],
   "id": 3
 }
@@ -199,6 +201,7 @@ Trade streams push raw trade information. Each trade has a unique buyer and sell
 **Examples:**
 - `btcusdt@trade`
 - `ethusdt@trade`
+- `solusdt@trade`
 
 ### Update Speed
 
@@ -273,6 +276,21 @@ Real-time (as trades occur).
   "q": "1.5000",
   "T": 1702900800123,
   "m": true,
+  "M": true
+}
+```
+
+**SOL trade:**
+```json
+{
+  "e": "trade",
+  "E": 1702900800456,
+  "s": "SOLUSDT",
+  "t": 1234567890,
+  "p": "98.25",
+  "q": "12.5000",
+  "T": 1702900800456,
+  "m": false,
   "M": true
 }
 ```
@@ -427,7 +445,10 @@ If connection limits are exceeded:
 
 | Item | Stream | Symbols |
 |------|--------|---------|
-| Trade streams | `<symbol>@trade` | `btcusdt`, `ethusdt` |
+| Trade streams | `<symbol>@trade` | `btcusdt`, `ethusdt`, `solusdt` |
+| Depth streams | `<symbol>@depth@100ms` | `btcusdt`, `ethusdt`, `solusdt` |
+
+**Note:** The symbol list is configurable via feed handler configuration files. The system architecture supports adding additional symbols without code changes — only configuration updates are required. See `config/trade_feed_handler.json` and `config/quote_feed_handler.json`.
 
 ### Out of Scope
 
@@ -435,7 +456,7 @@ If connection limits are exceeded:
 |------|--------|
 | Aggregate trades | Not required |
 | Klines/Candlesticks | Not required |
-| Order book depth | Not required |
+| Order book depth (beyond L5) | Not required |
 | User data streams | Requires authentication |
 | REST API | Not used for market data |
 
@@ -448,3 +469,4 @@ If connection limits are exceeded:
 - `adr-001-timestamps-and-latency-measurement.md` (timestamp field mapping)
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` (connection handling)
 - `adr-006-recovery-and-replay-strategy.md` (reconnection, data gaps)
+- `adr-009-order-book-architecture.md` (depth stream handling)
