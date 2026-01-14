@@ -331,7 +331,7 @@ These trade-offs are acceptable for a production-grade system.
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (TP logging, single file)
 - `adr-004-real-time-analytics-computation.md` (RTE bucketed design)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (ephemeral telemetry)
-- `adr-009-l5-order-book-architecture.md` (quote data, L5 depth)
+- `adr-009-order-book-architecture.md` (quote data, L5 depth)
 - `adr-010-log-management-and-lifecycle.md` (LOG process details)
 - `kdb/tp.q` (logging implementation)
 - `kdb/rdb.q` (replay implementation)

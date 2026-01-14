@@ -1,11 +1,11 @@
-# ADR-009: L5 Order Book Architecture
+# ADR-009: Order Book Architecture
 
 ## Status
-Accepted (Updated 2026-01-11)
+Accepted (Updated 2026-01-14)
 
 ## Date
 Original: 2025-12-29
-Updated: 2026-01-03, 2026-01-06, 2026-01-11
+Updated: 2026-01-03, 2026-01-06, 2026-01-11, 2026-01-14
 
 ## Context
 
@@ -27,24 +27,30 @@ Binance specifies a reconciliation protocol:
 
 A decision is required on how to implement order book ingestion with correct reconciliation.
 
-**Update (2026-01-03):** Extended from L1 (best bid/ask only) to L5 (5 levels of depth) to enable richer analytics including multi-level order book imbalance.
+**Update (2026-01-03):** Extended from Level 1 (best bid/ask only) to Level 2 with 5 levels of depth to enable richer analytics including multi-level order book imbalance.
 
 **Update (2026-01-06):** Added timing measurements (`fhParseUs`, `fhSendUs`) for latency analysis consistent with trade feed handler (see ADR-001).
 
 **Update (2026-01-11):** Corrected logging section to align with ADR-003 (single log file per day).
+
+**Update (2026-01-14):** Standardized terminology to use "Level 2 (5 levels)" instead of "L5" for clarity.
 
 ## Notation
 
 | Acronym | Definition |
 |---------|------------|
 | FH | Feed Handler |
-| L1 | Level 1 (best bid/ask only) |
-| L5 | Level 5 (top 5 price levels) |
+| L1 | Level 1 — best bid/ask only (top of book) |
+| L2 | Level 2 — multiple price levels of depth |
 | TP | Tickerplant |
+
+**Depth terminology used in this document:**
+- "Level 2 (5 levels)" or "L2 depth" refers to order book data with 5 price levels per side
+- The system captures the top 5 bid and top 5 ask levels
 
 ## Decision
 
-L5 quotes are ingested via a dedicated Quote Feed Handler process that implements snapshot + delta reconciliation with a state machine and publishes 5 levels of bid/ask depth with timing measurements.
+Level 2 quotes (5 levels of depth) are ingested via a dedicated Quote Feed Handler process that implements snapshot + delta reconciliation with a state machine and publishes 5 levels of bid/ask depth with timing measurements.
 
 ### Process Architecture
 
@@ -54,8 +60,8 @@ L5 quotes are ingested via a dedicated Quote Feed Handler process that implement
 |--------|----------|----------|
 | Data source | `@trade` stream | `@depth` stream + REST |
 | Complexity | Simple (stateless) | Complex (book state, reconciliation) |
-| State | None | L5 order book per symbol |
-| Parse timing | JSON parse only (~20-50μs p95) | Parse + book update + L5 extract (~100-300μs p95) |
+| State | None | L2 order book per symbol (5 levels) |
+| Parse timing | JSON parse only (~20-50μs p95) | Parse + book update + depth extract (~100-300μs p95) |
 | Failure mode | Independent | Independent |
 | Restart | No impact on quotes | No impact on trades |
 
@@ -98,13 +104,13 @@ Following ADR-001, the quote feed handler captures timing measurements:
 
 **Parse timing (`fhParseUs`):**
 - Starts: WebSocket message buffer available
-- Includes: JSON parse + order book state update + L5 extraction
-- Ends: After L5 quote is extracted
+- Includes: JSON parse + order book state update + 5-level extraction
+- Ends: After quote snapshot is extracted
 - Measurement: `std::chrono::steady_clock` (monotonic)
 
 **Send timing (`fhSendUs`):**
-- Starts: After L5 extraction completes
-- Includes: L5 snapshot construction + kdb+ IPC serialization
+- Starts: After depth extraction completes
+- Includes: Quote snapshot construction + kdb+ IPC serialization
 - Ends: After IPC send initiation
 - Measurement: `std::chrono::steady_clock` (monotonic)
 
@@ -119,7 +125,6 @@ Following ADR-001, the quote feed handler captures timing measurements:
 See ADR-001 for full timing measurement specification.
 
 ### State Machine
-
 ```
 INIT --> SYNCING --> VALID <--> INVALID
   ^                    |           |
@@ -132,7 +137,7 @@ INIT --> SYNCING --> VALID <--> INVALID
 |-------|-------------|-------------|
 | INIT | No data, buffering deltas | Start snapshot fetch → SYNCING |
 | SYNCING | Snapshot received, applying buffered deltas | Valid delta → VALID |
-| VALID | Book consistent, publishing L5 | Sequence gap → INVALID |
+| VALID | Book consistent, publishing quotes | Sequence gap → INVALID |
 | INVALID | Sequence gap detected | Reset → INIT |
 
 **Timing during state transitions:**
@@ -157,7 +162,7 @@ Per Binance specification:
 | Aspect | Value | Rationale |
 |--------|-------|-----------|
 | Internal book depth | Full (sorted map) | Required for correct delta application |
-| Published depth | L5 (5 levels) | Rich enough for imbalance, manageable schema |
+| Published depth | 5 levels per side | Rich enough for imbalance, manageable schema |
 | REST snapshot request | 50 levels | Ensure coverage during reconciliation |
 
 ### Publication Discipline
@@ -167,13 +172,13 @@ Per Binance specification:
 - Validity state changes (VALID → INVALID or vice versa)
 
 **Publication rules:**
-- Publish full L5 snapshot on each update
+- Publish full 5-level snapshot on each update
 - Include `isValid` flag for downstream trust
 - Include timing measurements (`fhParseUs`, `fhSendUs`)
 - Downstream can filter on `isValid = 1b` for clean data
 
 Rationale:
-- Simplifies downstream logic (always full L5 state)
+- Simplifies downstream logic (always full depth state)
 - Consistent with tick-by-tick trade publishing
 - `isValid` flag protects downstream from stale data
 - Timing enables performance analysis per handler type
@@ -205,7 +210,7 @@ Downstream consumers see explicit invalid state and can react appropriately.
 | 24 | `exchEventTimeMs` | long | Binance | Exchange event time |
 | 25 | `fhRecvTimeUtcNs` | long | FH | Wall-clock receive (ns) |
 | 26 | `fhParseUs` | long | FH | Parse + book update latency (μs) |
-| 27 | `fhSendUs` | long | FH | L5 build + send latency (μs) |
+| 27 | `fhSendUs` | long | FH | Snapshot build + send latency (μs) |
 | 28 | `fhSeqNo` | long | FH | FH sequence number |
 | 29 | `tpRecvTimeUtcNs` | long | TP | TP receive time (ns) |
 | 30 | `rdbApplyTimeUtcNs` | long | RDB | RDB apply time (ns) |
@@ -250,12 +255,12 @@ This approach was selected because:
 - **Separation**: Quote FH failure doesn't affect trade ingestion
 - **Simplicity**: State machine is clear and testable
 - **Performance**: Flat-array design is cache-efficient for multi-symbol workloads
-- **Analytics**: L5 depth enables order book imbalance calculations
+- **Analytics**: 5-level depth enables order book imbalance calculations
 - **Observability**: Timing measurements enable performance comparison vs trade handler
 
-### L5 vs L1 Rationale
+### Level 2 (5 levels) vs Level 1 Rationale
 
-L5 was selected over L1 because:
+Level 2 with 5 levels of depth was selected over Level 1 (best bid/ask only) because:
 - Enables multi-level order book imbalance: `(sum bidQty) vs (sum askQty)`
 - Provides richer market microstructure data
 - Flat schema (22 price/qty columns) is efficient for kdb+ analytics
@@ -297,17 +302,17 @@ Rejected:
 - Violates "downstream must trust book" principle
 - Debugging nightmare
 
-### 5. L1 only (original design)
+### 5. Level 1 only (original design)
 Superseded:
 - Insufficient for multi-level imbalance analytics
-- L5 overhead is minimal with flat-array design
+- 5-level overhead is minimal with flat-array design
 - Wide schema is more efficient than nested lists
 
 ### 6. Nested list schema for variable depth
 Rejected:
 - Higher memory overhead in kdb+
 - More complex queries
-- Fixed L5 depth is sufficient and more efficient
+- Fixed 5-level depth is sufficient and more efficient
 
 ### 7. Per-symbol OrderBook objects
 Rejected:
@@ -330,7 +335,7 @@ Updated:
 - Independent process lifecycle
 - Clear state machine for debugging
 - Cache-efficient flat-array design
-- L5 depth enables imbalance analytics
+- 5-level depth enables imbalance analytics
 - Timing measurements enable performance analysis
 - Consistent instrumentation with trade handler
 - Per-event timing simpler than separate telemetry
@@ -345,7 +350,7 @@ Updated:
 - Parse timing higher than trade handler (expected due to stateful processing)
 - Timing fields increase storage volume (acceptable for exploratory project)
 
-These trade-offs are acceptable for correct L5 data with observability.
+These trade-offs are acceptable for correct Level 2 data with observability.
 
 ## Implementation
 
@@ -360,21 +365,20 @@ These trade-offs are acceptable for correct L5 data with observability.
 ```cpp
 // Parse timing
 auto parseStart = std::chrono::steady_clock::now();
-processMessage(msg, fhRecvTimeUtcNs);  // includes JSON parse + book update + L5 extract
+processMessage(msg, fhRecvTimeUtcNs);  // includes JSON parse + book update + depth extract
 auto parseEnd = std::chrono::steady_clock::now();
 lastParseUs_ = duration_cast<microseconds>(parseEnd - parseStart).count();
 
 // Send timing
 auto sendStart = std::chrono::steady_clock::now();
-// ... build L5 snapshot + IPC serialization ...
+// ... build 5-level snapshot + IPC serialization ...
 auto sendEnd = std::chrono::steady_clock::now();
 long long fhSendUs = duration_cast<microseconds>(sendEnd - sendStart).count();
 ```
 
 ## Derived Analytics
 
-The RTE computes order book imbalance from L5 quotes:
-
+The RTE computes order book imbalance from Level 2 quotes:
 ```q
 / Sum depth across all 5 levels
 bidDepth: sum (bidQty1; bidQty2; bidQty3; bidQty4; bidQty5)
@@ -391,8 +395,8 @@ See ADR-004 for RTE analytics details.
 Based on production telemetry (see ADR-005):
 
 **Quote Feed Handler (p95 latencies):**
-- `fhParseUs`: 100-300μs (JSON parse + book update + L5 extraction)
-- `fhSendUs`: 5-10μs (L5 snapshot build + IPC send)
+- `fhParseUs`: 100-300μs (JSON parse + book update + depth extraction)
+- `fhSendUs`: 5-10μs (snapshot build + IPC send)
 
 **Comparison to Trade Feed Handler:**
 - Quote parse is 5-10x slower (stateful processing)
@@ -407,7 +411,7 @@ These measurements validate:
 
 | Enhancement | Trigger |
 |-------------|---------|
-| L10/L20 publication | Deeper analytics requirement |
+| 10 or 20 level publication | Deeper analytics requirement |
 | Async snapshot fetch | Latency sensitivity |
 | Weighted imbalance | Price-weighted analytics |
 | Book pressure metrics | Trading strategy requirement |

@@ -212,4 +212,4 @@ q
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` (market data flow)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (health metrics)
 - `adr-006-recovery-and-replay-strategy.md` (replay mechanism)
-- `adr-009-l5-order-book-architecture.md` (quote data source)
+- `adr-009-order-book-architecture.md` (quote data source)

@@ -566,7 +566,7 @@ These trade-offs are acceptable for the current phase.
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (health metrics, safe queries)
 - `adr-006-recovery-and-replay-strategy.md` (manual replay)
 - `adr-007-visualisation-and-consumption-strategy.md` (observability via dashboard)
-- `adr-009-l5-order-book-architecture.md` (quote handler state machine, OrderBookManager)
+- `adr-009-order-book-architecture.md` (quote handler state machine, OrderBookManager)
 - `cpp/include/config.hpp` (JSON configuration)
 - `cpp/include/logger.hpp` (spdlog wrapper)
 - `cpp/src/trade_feed_handler.cpp` (implementation)

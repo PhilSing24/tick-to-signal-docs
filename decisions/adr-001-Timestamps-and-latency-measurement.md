@@ -339,4 +339,4 @@ SLOs should explicitly state:
 - `../api-binance.md`
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (for telemetry aggregation details)
 - `adr-006-recovery-and-replay-strategy.md` (for recovery deferral context)
-- `adr-009-L1-Order-Book-Architecture.md` (for quote handler state machine details)
+- `adr-009-Order-Book-Architecture.md` (for quote handler state machine details)

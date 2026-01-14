@@ -369,6 +369,6 @@ These measurements validate the architectural decision to instrument both handle
 - `adr-004-real-time-analytics-computation.md` (RTE analytics)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (timing aggregation in TEL)
 - `adr-006-recovery-and-replay-strategy.md` (recovery and replay)
-- `adr-009-L1-Order-Book-Architecture.md` (quote handler order book details)
+- `adr-009-Order-Book-Architecture.md` (quote handler order book details)
 - `docs/specs/trades-schema.md` (trade table schema)
 - `docs/specs/quotes-schema.md` (quote table schema

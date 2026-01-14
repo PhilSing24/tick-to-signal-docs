@@ -78,7 +78,7 @@ Architecture:
 
 Your knowledge base includes:
 - paper/: Academic white paper on the system
-- decisions/: Architecture Decision Records (ADR-001 through ADR-009)
+- decisions/: Architecture Decision Records (ADR-001 through ADR-010)
 - specs/: Data schemas and APIs
 - reference/: External references
 - notes/: Implementation notes
