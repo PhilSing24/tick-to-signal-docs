@@ -75,4 +75,4 @@ If you're interested in the implementation or have questions, feel free to reach
 
 **Tick Data to Signals: Real-Time Crypto Analytics on KDB-X**
 
-Draft available at [paper/tick-data-to-signals-v1.0-draft.pdf](paper/tick-data-to-signals-v1.0-draft.pdf).
+Draft available at [paper/Real_time_Crypto_KDB.pdf](paper/Real_time_Crypto_KDB.pdf).
