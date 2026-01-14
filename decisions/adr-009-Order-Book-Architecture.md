@@ -419,12 +419,12 @@ These measurements validate:
 
 ## Links / References
 
-- `../kdbx-real-time-architecture-reference.md`
-- `../api-binance.md` (depth stream specification)
+- `reference/kdbx-real-time-architecture-reference.md`
 - `adr-001-timestamps-and-latency-measurement.md` (timing measurement specification)
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` (ingestion architecture)
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (single log file per day)
 - `adr-004-real-time-analytics-computation.md` (RTE imbalance)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (timing aggregation)
 - `adr-008-error-handling-strategy.md` (reconnect, error handling)
-- `docs/specs/quotes-schema.md` (full schema specification)
+- `specs/api-binance.md` (depth stream specification)
+- `specs/quotes-schema.md` (full schema specification)

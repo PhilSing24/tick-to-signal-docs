@@ -326,14 +326,10 @@ These trade-offs are acceptable for a production-grade system.
 
 ## Links / References
 
-- `../kdbx-real-time-architecture-reference.md`
+- `reference/kdbx-real-time-architecture-reference.md`
 - `adr-001-timestamps-and-latency-measurement.md` (sequence numbers, timing fields)
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (TP logging, single file)
 - `adr-004-real-time-analytics-computation.md` (RTE bucketed design)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (ephemeral telemetry)
 - `adr-009-order-book-architecture.md` (quote data, L5 depth)
 - `adr-010-log-management-and-lifecycle.md` (LOG process details)
-- `kdb/tp.q` (logging implementation)
-- `kdb/rdb.q` (replay implementation)
-- `kdb/rte.q` (replay implementation)
-- `kdb/logmgr.q` (LOG process)

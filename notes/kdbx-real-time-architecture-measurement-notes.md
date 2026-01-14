@@ -11,7 +11,7 @@ It serves as:
 
 This document is **project-specific** and reflects decisions made in the ADRs.
 
-*Last updated: 2026-01-07*
+*Last updated: 2026-01-14*
 
 ## Notation
 
@@ -20,6 +20,7 @@ This document is **project-specific** and reflects decisions made in the ADRs.
 | E2E | End-to-End |
 | FH | Feed Handler |
 | IPC | Inter-Process Communication |
+| L2 | Level 2 market depth (5 price levels per side) |
 | NTP | Network Time Protocol |
 | PTP | Precision Time Protocol (IEEE 1588) |
 | RDB | Real-Time Database |
@@ -71,12 +72,12 @@ Both trade and quote feed handlers capture identical instrumentation fields:
 | Handler | `fhParseUs` includes | Expected p95 |
 |---------|---------------------|--------------|
 | Trade FH | JSON parse + field extraction | 20-50µs |
-| Quote FH | JSON parse + book update + L5 extraction | 100-300µs |
+| Quote FH | JSON parse + book update + L2 extraction | 100-300µs |
 
 | Handler | `fhSendUs` includes | Expected p95 |
 |---------|---------------------|--------------|
 | Trade FH | IPC message build + serialization | 5-10µs |
-| Quote FH | L5 snapshot build + IPC serialization | 5-10µs |
+| Quote FH | L2 snapshot build + IPC serialization | 5-10µs |
 
 Notes:
 - `fhRecvTimeUtcNs` is wall-clock for cross-process correlation
@@ -94,7 +95,7 @@ Notes:
 - Captured in `.u.upd` handler
 - Converted from `.z.p` to nanoseconds since Unix epoch
 - Used for FH-to-TP latency calculation
-- TP logs to separate files per data type (ADR-003)
+- TP logs to a single file per day containing all market data (ADR-003)
 
 ### Real-Time Database
 
@@ -115,7 +116,7 @@ RTE does not add timestamps to market data. It computes analytics (VWAP, imbalan
 | Metric | Description | Implementation |
 |--------|-------------|----------------|
 | VWAP | Volume-weighted average price | Time-bucketed aggregation (1s buckets) |
-| Imbalance | Order book imbalance | Latest L5 snapshot per symbol |
+| Imbalance | Order book imbalance | Latest L2 snapshot per symbol |
 
 Notes:
 - RTE subscribes directly to TP (peer to RDB)
@@ -129,7 +130,7 @@ TEL aggregates latency metrics from RDB queries:
 | Table | Contents | Source |
 |-------|----------|--------|
 | `telemetry_latency_fh` | FH segment percentiles (unified trade + quote) | RDB query |
-| `telemetry_latency_e2e` | Cross-process percentiles (trades only) | RDB query |
+| `telemetry_latency_e2e` | Cross-process percentiles (trades and quotes) | RDB query |
 | `telemetry_system` | Memory usage per process | RDB, RTE, TEL queries |
 | `health_feed_handler` | FH health metrics | TP subscription |
 
@@ -165,7 +166,7 @@ Notes:
 | TP receive | `tpRecvTimeUtcNs` | ✓ Implemented |
 | RDB apply | `rdbApplyTimeUtcNs` | ✓ Implemented |
 
-Note: Quote table also includes 22 L5 price/qty fields and `isValid` flag.
+Note: Quote table also includes 22 L2 price/qty fields and `isValid` flag.
 
 ## Segment Latency Definitions
 
@@ -190,7 +191,7 @@ All timestamps use nanoseconds since epoch. Unit conversions are explicit.
 | `tp_to_rdb_ms` | TP receive to RDB apply | `(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) / 1e6` | ✓ Measurable |
 | `e2e_to_rdb_ms` | FH receive to RDB apply | `(rdbApplyTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | ✓ Measurable |
 
-Note: E2E latency is computed for trades only in TEL (quote E2E is less meaningful due to stateful processing).
+Note: E2E latency is computed for both trades and quotes in TEL. Quote E2E latency includes stateful order book processing, so parse times are higher than trades.
 
 ### Unit Conversions
 
@@ -313,7 +314,8 @@ Quote FH parse latency p95 < 300µs over 1-minute rolling window
 FH send latency p95 < 10µs over 1-minute rolling window (both handlers)
 FH to TP latency p95 < 5ms over 1-minute rolling window (single host)
 TP to RDB latency p95 < 1ms over 1-minute rolling window (single host)
-E2E to RDB p95 < 10ms over 1-minute rolling window (single host, trades)
+Trade E2E to RDB p95 < 10ms over 1-minute rolling window (single host)
+Quote E2E to RDB p95 < 15ms over 1-minute rolling window (single host)
 ```
 
 ## Telemetry Aggregation
@@ -327,7 +329,7 @@ TEL computes telemetry aggregations every 5 seconds via timer, querying RDB for 
 | Table | Contents | Handler |
 |-------|----------|---------|
 | `telemetry_latency_fh` | FH segment latencies (parseUs, sendUs) — p50/p95/max per bucket | Both (unified with `handler` column) |
-| `telemetry_latency_e2e` | Cross-process latencies (fhToTp, tpToRdb, e2e) — p50/p95/max per bucket | Trades only |
+| `telemetry_latency_e2e` | Cross-process latencies (fhToTp, tpToRdb, e2e) — p50/p95/max per bucket | Both (unified with `handler` column) |
 | `telemetry_system` | Memory usage (heapMB, usedMB) | RDB, RTE, TEL |
 | `health_feed_handler` | FH health metrics (uptime, counts, state) | Both |
 
@@ -354,13 +356,23 @@ select handler, sym, avg parseUs_p95 as avgParse_p95
   where bucket > .z.p - 00:05:00
   by handler, sym
 
-/ E2E latency trend (last 5 minutes, trades only)
+/ E2E latency trend (last 5 minutes, both handlers)
 select from telemetry_latency_e2e where bucket > .z.p - 0D00:05:00
+
+/ Compare E2E latency by handler type
+select avg e2eMs_p95 by handler, sym
+  from telemetry_latency_e2e
+  where bucket > .z.p - 0D00:05:00
 
 / 1-minute rolling p95 for trade FH parse latency
 select p95_1min:avg parseUs_p95 by sym 
   from telemetry_latency_fh 
   where handler=`trade_fh, bucket > .z.p - 0D00:01:00
+
+/ 1-minute rolling p95 for quote FH parse latency
+select p95_1min:avg parseUs_p95 by sym 
+  from telemetry_latency_fh 
+  where handler=`quote_fh, bucket > .z.p - 0D00:01:00
 
 / Feed handler health
 .tel.fhStatusTable[]
@@ -435,8 +447,8 @@ Recommendation: Exclude replay data from E2E SLO calculations.
 
 - [x] Capture `fhRecvTimeUtcNs` using `std::chrono::system_clock`
 - [x] Capture monotonic start time using `std::chrono::steady_clock`
-- [x] Compute `fhParseUs` after parse + book update + L5 extraction
-- [x] Compute `fhSendUs` after L5 build (before IPC send)
+- [x] Compute `fhParseUs` after parse + book update + L2 extraction
+- [x] Compute `fhSendUs` after L2 build (before IPC send)
 - [x] Increment `fhSeqNo` per published message
 - [x] Extract `E` from Binance depth update JSON
 - [x] Maintain order book state (snapshot + delta reconciliation)
@@ -449,7 +461,7 @@ Recommendation: Exclude replay data from E2E SLO calculations.
 - [x] Capture `tpRecvTimeUtcNs` in `.u.upd` handler using `.z.p`
 - [x] Convert `.z.p` to nanoseconds since epoch
 - [x] Add `tpRecvTimeUtcNs` to both trade and quote schemas
-- [x] Log to separate files per data type (`-11!` compatible format)
+- [x] Log to single file per day (`-11!` compatible format)
 - [x] Handle subscriber disconnect (`.z.pc`)
 
 ### RDB (q) — ✓ Complete
@@ -464,7 +476,7 @@ Recommendation: Exclude replay data from E2E SLO calculations.
 
 - [x] Subscribe to TP for trades and quotes
 - [x] Compute VWAP using time-bucketed aggregation
-- [x] Compute order book imbalance from L5 quotes
+- [x] Compute order book imbalance from L2 quotes
 - [x] Maintain configurable retention (10 minutes)
 - [x] Auto-replay from logs on startup
 
@@ -474,7 +486,7 @@ Recommendation: Exclude replay data from E2E SLO calculations.
 - [x] Query RDB for latency data (persistent handles)
 - [x] Query RTE for memory stats (persistent handles)
 - [x] Compute FH latency aggregations (unified trade + quote)
-- [x] Compute E2E latency aggregations (trades only)
+- [x] Compute E2E latency aggregations (trades and quotes)
 - [x] Compute system memory metrics
 - [x] Implement 15-minute retention cleanup
 
@@ -487,15 +499,15 @@ Recommendation: Exclude replay data from E2E SLO calculations.
 
 ## Links / References
 
-- `kdbx-real-time-architecture-reference.md`
-- `adr-001-timestamps-and-latency-measurement.md` (authoritative field definitions)
-- `adr-002-feed-handler-to-kdb-ingestion-path.md` (FH to TP path)
-- `adr-003-tickerplant-logging-and-durability-strategy.md` (TP logging)
-- `adr-004-real-time-rolling-analytics-computation.md` (RTE analytics)
-- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (TEL aggregation)
-- `adr-006-recovery-and-replay-strategy.md` (log replay)
-- `adr-007-visualisation-and-consumption-strategy.md` (latency dashboard display)
-- `adr-009-l5-order-book-architecture.md` (quote handler timing)
-- `adr-010-log-management-and-lifecycle.md` (LOG process)
-- `trades-schema.md` (trade table schema)
-- `quotes-schema.md` (quote table schema)
+- `reference/kdbx-real-time-architecture-reference.md`
+- `decisions/adr-001-timestamps-and-latency-measurement.md` (authoritative field definitions)
+- `decisions/adr-002-feed-handler-to-kdb-ingestion-path.md` (FH to TP path)
+- `decisions/adr-003-tickerplant-logging-and-durability-strategy.md` (TP logging)
+- `decisions/adr-004-real-time-analytics-computation.md` (RTE analytics)
+- `decisions/adr-005-telemetry-and-metrics-aggregation-strategy.md` (TEL aggregation)
+- `decisions/adr-006-recovery-and-replay-strategy.md` (log replay)
+- `decisions/adr-007-visualisation-and-consumption-strategy.md` (latency dashboard display)
+- `decisions/adr-009-order-book-architecture.md` (quote handler timing)
+- `decisions/adr-010-log-management-and-lifecycle.md` (LOG process)
+- `specs/trades-schema.md` (trade table schema)
+- `specs/quotes-schema.md` (quote table schema)

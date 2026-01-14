@@ -681,4 +681,4 @@ Rejected:
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (ephemeral stance)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (latency tracking moved here)
 - `adr-007-visualisation-and-consumption-strategy.md` (dashboard consumption)
-- `adr-009-L5-Order-Book-Architecture.md` (quote feed handler details)
+- `adr-009-Order-Book-Architecture.md` (quote feed handler details)

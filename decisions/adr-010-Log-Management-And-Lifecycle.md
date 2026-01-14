@@ -305,4 +305,3 @@ These trade-offs are acceptable for the current phase.
 
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (log file format, single file)
 - `adr-006-recovery-and-replay-strategy.md` (replay mechanism)
-- `kdb/logmgr.q` (implementation)

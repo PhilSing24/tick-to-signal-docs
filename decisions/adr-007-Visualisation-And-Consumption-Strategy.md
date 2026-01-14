@@ -339,8 +339,8 @@ These trade-offs are acceptable for the current phase.
 
 ## Links / References
 
-- `../kdbx-real-time-architecture-reference.md`
-- `../kdbx-real-time-architecture-measurement-notes.md`
+- `reference/kdbx-real-time-architecture-reference.md`
+- `notes/kdbx-real-time-architecture-measurement-notes.md`
 - `adr-001-timestamps-and-latency-measurement.md` (latency metrics definitions)
 - `adr-004-real-time-rolling-analytics-computation.md` (RTE analytics, validity flags)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (TEL tables, bucket alignment)

@@ -43,7 +43,7 @@ A decision is required on how errors are handled across the system.
 |---------|------------|
 | FH | Feed Handler |
 | IPC | Inter-Process Communication |
-| L5 | Level 5 (top 5 price levels) |
+| L2 | Level 2 market depth (5 price levels per side) |
 | RDB | Real-Time Database |
 | RTE | Real-Time Engine |
 | TEL | Telemetry Process |
@@ -117,6 +117,8 @@ for (int i = 0; i < attempt && delay < MAX_BACKOFF_MS; ++i) {
 delay = std::min(delay, MAX_BACKOFF_MS);  // Cap at 8000ms
 ```
 
+**Note:** Binance recommends a maximum backoff of 30 seconds (see `api-binance.md`). This implementation uses 8 seconds for faster recovery during development, which is acceptable for an exploratory project with low connection volume (3 symbols, single instance). Production systems at scale should consider the longer backoff to avoid rate limiting during widespread outages.
+
 **Sequence validation:**
 ```cpp
 void TradeFeedHandler::validateTradeId(const std::string& sym, long long tradeId) {
@@ -159,7 +161,7 @@ static void signalHandler(int signum) {
 | TP connection lost | Connection | Log, reconnect to TP | IPC returns nullptr |
 | REST snapshot failure | Recoverable | Log, retry with backoff | `restClient_.fetchSnapshot()` error |
 | Sequence gap detected | Recoverable | Log, transition to INVALID, re-sync | `OrderBookManager` state machine |
-| Book in INVALID state | Recoverable | Publish invalid L5 quote, attempt re-sync | `publishInvalid()` called |
+| Book in INVALID state | Recoverable | Publish invalid L2 quote, attempt re-sync | `publishInvalid()` called |
 | JSON parse error | Transient | Log warning, skip message | Early return on parse error |
 | IPC send failure | Connection | Log, reconnect TP | Result nullptr triggers reconnect |
 
@@ -168,7 +170,7 @@ static void signalHandler(int signum) {
 ```
 VALID ──sequence gap──► INVALID ──re-sync──► SYNCING ──► VALID
                             │
-                            └──publish invalid L5 quote (isValid=0b)
+                            └──publish invalid L2 quote (isValid=0b)
 ```
 
 **OrderBookManager state tracking:**
@@ -176,7 +178,7 @@ VALID ──sequence gap──► INVALID ──re-sync──► SYNCING ──�
 enum class BookState {
     INIT,      // No data, buffering deltas
     SYNCING,   // Snapshot received, applying buffered deltas
-    VALID,     // Book consistent, publishing L5
+    VALID,     // Book consistent, publishing L2
     INVALID    // Sequence gap detected
 };
 ```
@@ -315,320 +317,3 @@ if (!snapshot.success) {
   res
   };
 ```
-
-**Benefits of persistent handles:**
-- Eliminates TCP handshake overhead per query cycle
-- Automatic reconnection on next query after failure
-- Handle status visible via `.tel.handleStatus[]`
-- Graceful cleanup on shutdown via `.z.exit`
-
-### Logging Strategy
-
-**Implementation: spdlog (C++) and console output (q)**
-
-**C++ Log Levels:**
-
-| Level | Usage | spdlog API |
-|-------|-------|------------|
-| ERROR | Failures requiring attention | `spdlog::error()` |
-| WARN | Recoverable issues | `spdlog::warn()` |
-| INFO | Normal operations | `spdlog::info()` |
-| DEBUG | Diagnostic detail | `spdlog::debug()` |
-| TRACE | Verbose tracing | `spdlog::trace()` |
-
-**Format (spdlog default):**
-```
-[YYYY-MM-DD HH:MM:SS.mmm] [Component] [LEVEL] Message
-```
-
-**Examples:**
-```
-[2026-01-06 08:59:54.341] [Trade FH] [info] Logger initialized (level: info)
-[2026-01-06 08:59:54.344] [Trade FH] [info] Connected to TP (handle 3)
-[2026-01-06 08:59:54.645] [Quote FH] [error] Sequence gap detected for BTCUSDT
-[2026-01-06 08:59:54.827] [Quote FH] [info] BTCUSDT is now VALID
-```
-
-**Configuration (JSON):**
-```json
-{
-    "logging": {
-        "level": "info",
-        "file": ""  // Empty = console only
-    }
-}
-```
-
-**Q log format (informal):**
-```
-2026.01.06D09:00:15.123 Connecting to tickerplant on port 5010...
-2026.01.06D09:00:15.456 Subscribed to: trade_binance
-```
-
-### What IS Implemented
-
-| Scenario | Status | Implementation |
-|----------|--------|----------------|
-| FH reconnect to Binance | ✓ Implemented | Exponential backoff in `runWebSocketLoop()` |
-| FH reconnect to TP | ✓ Implemented | Exponential backoff in `connectToTP()` |
-| Signal handling (SIGINT/SIGTERM) | ✓ Implemented | Global handler calls `stop()` |
-| Structured logging (C++) | ✓ Implemented | spdlog with levels and timestamps |
-| Configuration from JSON | ✓ Implemented | `config.hpp` loads JSON configs |
-| Sequence gap detection | ✓ Implemented | `validateTradeId()` in trade FH |
-| Quote book state machine | ✓ Implemented | `OrderBookManager` with INIT/SYNCING/VALID/INVALID |
-| Health metrics publishing | ✓ Implemented | Both FHs publish every 5 seconds |
-| TP subscriber disconnect | ✓ Implemented | `.z.pc` handler |
-| TEL persistent handles | ✓ Implemented | `.tel.getH`, `.tel.safeQuery` with auto-reconnect |
-
-### What Is NOT Implemented
-
-Consistent with the exploratory nature:
-
-| Scenario | Status | Rationale |
-|----------|--------|-----------|
-| Automatic TP reconnect in RDB/RTE/TEL | Not implemented | Manual restart acceptable |
-| Automatic recovery on startup | Not implemented | Manual replay via `replay.q` |
-| Persistent error logs to file | Optional | File logging configurable but console primary |
-| External alerting | Not implemented | Human observation via dashboard |
-| Circuit breakers | Not implemented | Overkill for 3 symbols |
-| Dead letter queues | Not implemented | Dropped messages acceptable |
-| Distributed tracing | Not implemented | Single-host deployment |
-| Retry on JSON parse errors | Not implemented | Skip message, continue (fail fast on data) |
-
-### Error Visibility
-
-Errors are made visible through:
-
-| Method | Purpose | Implementation |
-|--------|---------|----------------|
-| Console output (spdlog) | Immediate visibility during development | Default sinks, colored output |
-| Optional file logs | Persistent audit trail | Configurable via JSON |
-| Dashboard staleness | `isValid`, `fillPct` indicate data quality | TEL queries |
-| Gap detection | `fhSeqNo` gaps observable in RDB | Sequence validation |
-| Quote validity | `isValid` in `quote_binance` indicates L5 book state | OrderBookManager |
-| Health metrics | FH uptime, message counts, connection state | `health_feed_handler` table |
-| Process exit | Fatal errors surface immediately | Exit codes |
-| Handle status | TEL connection state visible | `.tel.handleStatus[]` |
-
-### Startup Validation
-
-Each component validates its environment at startup:
-
-| Component | Validation | Implementation |
-|-----------|------------|----------------|
-| Trade FH | Config loads, symbols present | `config.load()` check |
-| Quote FH | Config loads, symbols present | `config.load()` check |
-| Both FHs | Can connect to TP | Retry with backoff, exit if stopped |
-| TP | Port available, log directory writable | q built-in checks |
-| RDB | Can connect to TP, subscription succeeds | `hopen` check |
-| RTE | Can connect to TP, subscription succeeds | `hopen` check |
-| TEL | Can connect to TP, subscription succeeds | `hopen` check |
-
-Failure during startup = immediate exit (fail fast).
-
-### Configuration Management
-
-**JSON Configuration Files:**
-
-| File | Component | Contents |
-|------|-----------|----------|
-| `config/trade_feed_handler.json` | Trade FH | Symbols, TP host/port, logging, backoff |
-| `config/quote_feed_handler.json` | Quote FH | Symbols, TP host/port, logging, backoff |
-
-**Example Configuration:**
-```json
-{
-    "symbols": ["btcusdt", "ethusdt", "solusdt"],
-    "tickerplant": {
-        "host": "localhost",
-        "port": 5010
-    },
-    "reconnect": {
-        "initial_backoff_ms": 1000,
-        "max_backoff_ms": 8000
-    },
-    "logging": {
-        "level": "info",
-        "file": ""
-    }
-}
-```
-
-**Config Loading:**
-```cpp
-FeedHandlerConfig config;
-if (!config.load(configPath)) {
-    std::cerr << "Failed to load config, exiting\n";
-    return 1;
-}
-```
-
-## Rationale
-
-This approach was selected because:
-
-- **Observability**: Structured logging (spdlog) provides production-quality diagnostics
-- **Reliability**: Automatic reconnection prevents manual restarts for transient issues
-- **Simplicity**: Complex retry logic avoided where not needed
-- **Visibility**: Fail-fast surfaces issues immediately
-- **Consistency**: Aligns with ADR-003 (logging) and ADR-006 (manual replay)
-- **Appropriate**: Error handling matches project maturity
-- **Debuggable**: Clear, timestamped logs aid understanding
-- **Independent**: Each process handles its own errors
-- **Configurable**: JSON configs allow easy adjustment without recompilation
-- **Efficient**: TEL persistent handles minimize IPC overhead (ADR-005)
-
-## Alternatives Considered
-
-### 1. No automatic reconnection (original design)
-Updated:
-- Frequent manual restarts were painful
-- Exponential backoff is industry standard
-- Implemented for FH components
-
-### 2. Console output only (no spdlog)
-Rejected:
-- std::cout/cerr lack timestamps, levels, formatting
-- spdlog adds minimal overhead
-- Production-quality logging worth the dependency
-
-### 3. Automatic reconnection for q processes
-Rejected:
-- Complex state management
-- Manual restart is explicit and clear
-- May be reconsidered for production
-
-### 4. Message validation layer
-Rejected:
-- Schema is controlled end-to-end
-- FH and TP are trusted components
-- Validation overhead not justified
-
-### 5. Shared error handling library
-Rejected:
-- Overkill for current scale
-- Each component has different error scenarios
-- Would add coupling between components
-
-### 6. Health check HTTP endpoints
-Rejected:
-- Adds infrastructure complexity
-- Dashboard provides sufficient visibility
-- No external monitoring system to consume
-
-### 7. Open/close IPC connections each query cycle (TEL)
-Rejected (2026-01-07):
-- 4 TCP handshakes per 5-second tick
-- Unnecessary overhead (~4-12ms per tick)
-- File descriptor churn
-- Persistent handles are simple and more efficient
-
-## Consequences
-
-### Positive
-
-- Simple, understandable error handling
-- Problems surface immediately (fail fast)
-- Easy to diagnose issues via structured logs
-- Automatic reconnection reduces manual intervention
-- Quote handler state machine handles L5 book recovery scenarios
-- Independent processes can be restarted independently
-- JSON configuration enables easy tuning
-- spdlog provides production-quality observability
-- Consistent error handling patterns across C++ components
-- Health metrics provide operational visibility
-- TEL persistent handles eliminate connection overhead
-
-### Negative / Trade-offs
-
-- Manual restart required for q components (RDB/RTE/TEL)
-- No automatic recovery on startup (manual replay required)
-- Transient errors cause data loss (by design)
-- Log format in q is informal (no structured logging)
-- spdlog dependency (acceptable - industry standard)
-- JSON config dependency (rapidjson already used)
-- Reconnection adds slight complexity to FH code
-- Persistent handles require explicit management (close on shutdown)
-
-These trade-offs are acceptable for the current phase.
-
-## Implementation Checklist
-
-### Implemented
-
-- [x] Trade FH: Exit on config load failure
-- [x] Trade FH: Reconnect to Binance with exponential backoff
-- [x] Trade FH: Reconnect to TP with exponential backoff
-- [x] Trade FH: Skip malformed JSON messages
-- [x] Trade FH: Sequence gap detection with logging
-- [x] Trade FH: Signal handling (SIGINT/SIGTERM)
-- [x] Trade FH: spdlog integration with levels
-- [x] Trade FH: JSON configuration loading
-- [x] Trade FH: Health metrics publishing
-- [x] Quote FH: All of the above plus:
-- [x] Quote FH: REST snapshot error handling
-- [x] Quote FH: Sequence gap detection and INVALID state
-- [x] Quote FH: State machine (INIT → SYNCING → VALID ↔ INVALID)
-- [x] Quote FH: OrderBookManager with per-symbol state tracking
-- [x] TP: `.z.pc` handles subscriber disconnect
-- [x] TP: `.u.sub` validates table name
-- [x] TP: Logging to single file per day (trades + quotes)
-- [x] RDB: Protected TP connection with error message
-- [x] RDB: Subscription to both trades and quotes
-- [x] RTE: Protected TP connection with error message
-- [x] RTE: Auto-initialize unknown symbols (VWAP + imbalance)
-- [x] TEL: Persistent handles with `.tel.getH`, `.tel.safeQuery`
-- [x] TEL: Automatic reconnection on query failure
-- [x] TEL: Handle status via `.tel.handleStatus[]`
-- [x] TEL: Graceful shutdown via `.z.exit`
-- [x] TEL: Subscription to health data
-
-### Recommended Enhancements
-
-- [ ] RDB: Automatic reconnect to TP
-- [ ] RTE: Automatic reconnect to TP
-- [ ] TEL: Automatic reconnect to TP (subscription)
-- [ ] All q: Protected timer callbacks consistently
-- [ ] All q: Structured logging (explore log4q or similar)
-- [ ] FH: Configurable health publish interval
-- [ ] FH: Optional file rotation for logs
-
-### Out of Scope
-
-- [ ] Automatic startup recovery (use manual replay)
-- [ ] External log aggregation (e.g., ELK stack)
-- [ ] Alerting system integration
-- [ ] Health check HTTP endpoints
-- [ ] Distributed tracing
-- [ ] Circuit breakers
-
-## Future Evolution
-
-| Enhancement | Trigger |
-|-------------|---------|
-| Automatic q reconnection | Frequent manual restarts become painful |
-| Automatic startup recovery | Production deployment |
-| External log aggregation | Multiple instances, log analysis |
-| Health endpoints | External monitoring integration |
-| Alerting | Production deployment |
-| Circuit breakers | High message rates, cascading failures |
-| Distributed tracing | Multi-host deployment |
-
-## Links / References
-
-- `../kdbx-real-time-architecture-reference.md` (fail-fast principle)
-- `adr-001-timestamps-and-latency-measurement.md` (fhSeqNo for gap detection)
-- `adr-002-feed-handler-to-kdb-ingestion-path.md` (separate processes, independent restart)
-- `adr-003-tickerplant-logging-and-durability-strategy.md` (TP logging)
-- `adr-004-real-time-analytics-computation.md` (RTE natural rebuild)
-- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (health metrics, persistent handles)
-- `adr-006-recovery-and-replay-strategy.md` (manual replay)
-- `adr-007-visualisation-and-consumption-strategy.md` (observability via dashboard)
-- `adr-009-order-book-architecture.md` (quote handler state machine, OrderBookManager)
-- `cpp/include/config.hpp` (JSON configuration)
-- `cpp/include/logger.hpp` (spdlog wrapper)
-- `cpp/src/trade_feed_handler.cpp` (implementation)
-- `cpp/src/quote_feed_handler.cpp` (implementation)
-- `kdb/tel.q` (persistent handle implementation)
-
-

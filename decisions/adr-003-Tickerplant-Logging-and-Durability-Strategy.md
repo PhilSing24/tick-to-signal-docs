@@ -207,7 +207,7 @@ q
 
 ## Links / References
 
-- `../kdbx-real-time-architecture-reference.md`
+- `reference/kdbx-real-time-architecture-reference.md`
 - `adr-001-timestamps-and-latency-measurement.md` (per-event fields)
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` (market data flow)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (health metrics)

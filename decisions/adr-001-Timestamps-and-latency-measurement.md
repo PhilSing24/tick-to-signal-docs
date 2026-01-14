@@ -334,8 +334,8 @@ SLOs should explicitly state:
 - Buffered delta replay during sync is included in `fhParseUs` for those events
 
 ## Links / References
-- `../kdbx-real-time-architecture-reference.md`
-- `../kdbx-real-time-architecture-measurement-notes.md`
+- `reference/kdbx-real-time-architecture-reference.md`
+- `notes/kdbx-real-time-architecture-measurement-notes.md`
 - `../api-binance.md`
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (for telemetry aggregation details)
 - `adr-006-recovery-and-replay-strategy.md` (for recovery deferral context)

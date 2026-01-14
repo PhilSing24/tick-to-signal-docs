@@ -372,10 +372,9 @@ These trade-offs are acceptable for the current phase.
 
 ## Links / References
 
-- `../kdbx-real-time-architecture-reference.md`
+- `reference/kdbx-real-time-architecture-reference.md`
 - `adr-001-timestamps-and-latency-measurement.md` (raw fields, SLO targets)
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (ephemeral stance)
 - `adr-004-real-time-rolling-analytics-computation.md` (RTE details)
 - `adr-007-visualisation-and-consumption-strategy.md` (dashboard consumption)
 - `adr-009-Order-Book-Architecture.md` (quote handler details)
-- `kdb/tel.q` (implementation)

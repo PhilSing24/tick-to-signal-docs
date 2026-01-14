@@ -13,7 +13,7 @@ This project ingests real-time Binance market data via WebSocket in C++ feed han
 
 Two data types are ingested:
 - **Trade data** – Individual trade executions from the trade stream
-- **Quote data** – L5 order book depth (5 levels of bid/ask) derived from depth stream
+- **Quote data** – L2 order book depth (5 levels of bid/ask) derived from depth stream
 
 There are multiple technically valid ingestion paths from an external feed handler into kdb, including:
 
@@ -33,7 +33,7 @@ This project is explicitly inspired by the *Building Real Time Event Driven KDB-
 |---------|------------|
 | FH | Feed Handler |
 | IPC | Inter-Process Communication |
-| L5 | 5 levels of order book depth |
+| L2 |  Level 2 market depth (5 price levels per side) |
 | RDB | Real-Time Database |
 | RTE | Real-Time Engine |
 | TP | Tickerplant |
@@ -55,7 +55,7 @@ Binance Depth Stream ──► Quote FH ──┘              └──► Logs
 | Handler | Data Type | State | Source |
 |---------|-----------|-------|--------|
 | Trade FH | `trade_binance` | Stateless | WebSocket trade stream |
-| Quote FH | `quote_binance` | Stateful (L5 order book) | WebSocket depth + REST snapshot |
+| Quote FH | `quote_binance` | Stateful (L2 order book) | WebSocket depth + REST snapshot |
 
 **Separate processes**: Each feed handler runs as an independent process. This follows the "single responsibility" principle and provides:
 - Independent failure domains
@@ -81,21 +81,21 @@ The trade feed handler is **stateless**:
 
 ### Quote Feed Handler
 
-The quote feed handler is **stateful** and maintains **L5 order book state**:
+The quote feed handler is **stateful** and maintains **L2 order book state**:
 - Uses **OrderBookManager** with flat-array architecture for cache efficiency
 - Maintains 5 levels of bid/ask depth per symbol
 - Fetches REST snapshot for initial sync
 - Applies WebSocket depth deltas incrementally
 - Validates sequence numbers for gap detection
 - **Captures timing measurements** (see ADR-001):
-  - `fhParseUs`: Parse + order book update + L5 extraction latency
-  - `fhSendUs`: L5 snapshot construction + IPC send latency
-- Publishes L5 quotes (22 price/qty fields) on each update
+  - `fhParseUs`: Parse + order book update + L2 extraction latency
+  - `fhSendUs`: L2 snapshot construction + IPC send latency
+- Publishes L2 quotes (22 price/qty fields) on each update
 - Tracks validity state per symbol (INIT → SYNCING → VALID ↔ INVALID)
 
 **Timing methodology**:
-- Parse timer includes: JSON parse + book update + L5 extraction
-- Send timer includes: L5 snapshot build + IPC serialization
+- Parse timer includes: JSON parse + book update + L2 extraction
+- Send timer includes: L2 snapshot build + IPC serialization
 - Significantly higher parse times than trade handler due to stateful processing
 - Both timings included in published message (see ADR-001)
 
@@ -180,7 +180,7 @@ neg[h] (`.u.upd; `quote_binance; quoteData)
 - **TP adds (1)**: `tpRecvTimeUtcNs`
 - **RDB adds (1)**: `rdbApplyTimeUtcNs`
 
-**Quote L5 Schema (30 fields total)**:
+**Quote L2 Schema (30 fields total)**:
 - **FH sends (28)**: 
   - `time`, `sym`
   - `bidPrice1-5`, `bidQty1-5` (10 fields)
@@ -234,9 +234,9 @@ Running trade and quote handlers as separate processes was selected because:
 - Matches "single responsibility" principle from reference architecture
 - Allows independent timing analysis (trade vs quote latency comparison)
 
-### L5 vs L1 Rationale
+### L2 vs L1 Rationale
 
-L5 depth was selected over L1 (best bid/ask only) because:
+L2 with 5 levels depth was selected over L1 (best bid/ask only) because:
 - Enables order book imbalance calculations across multiple levels
 - Provides richer market microstructure data
 - Flat-array architecture keeps memory overhead minimal
@@ -303,7 +303,7 @@ Rejected because:
 Rejected because:
 - Limits analytics to top-of-book only
 - Cannot calculate multi-level imbalance
-- L5 overhead is minimal with flat-array design
+- L2 overhead is minimal with flat-array design
 
 ### 9. Separate Telemetry Channel for Timing
 Rejected because:
@@ -320,12 +320,12 @@ Rejected because:
 - Clear ownership boundaries between components
 - Easy to reason about latency and ordering
 - Trade feed handler remains simple and stateless
-- Quote feed handler encapsulates L5 book complexity efficiently
+- Quote feed handler encapsulates L2 book complexity efficiently
 - Tick-by-tick publishing provides clear latency visibility
 - Asynchronous IPC minimises feed handler blocking
 - Independent processes allow independent restart and timing analysis
 - Single TP simplifies subscriber management
-- L5 depth enables richer analytics (imbalance across levels)
+- L2 depth enables richer analytics (imbalance across levels)
 - Per-event timing enables detailed latency analysis
 - Raw timing data available in RDB for debugging
 - Both handlers instrumented consistently
@@ -338,7 +338,7 @@ Rejected because:
 - Asynchronous publishing means no delivery confirmation
 - Tick-by-tick has higher IPC overhead than batching
 - Messages are lost if connection drops (no local buffering)
-- L5 schema is wider than L1 (30 vs 14 fields)
+- L2 schema is wider than L1 (30 vs 14 fields)
 - Per-event timing fields increase storage volume (acceptable for exploratory project)
 - Quote handler timing includes stateful processing (higher than trade handler)
 
@@ -362,13 +362,13 @@ These measurements validate the architectural decision to instrument both handle
 
 ## Links / References
 
-- `../kdbx-real-time-architecture-reference.md`
-- `../kdbx-real-time-architecture-measurement-notes.md`
+- `reference/kdbx-real-time-architecture-reference.md`
+- `notes/kdbx-real-time-architecture-measurement-notes.md`
 - `adr-001-timestamps-and-latency-measurement.md` (timestamp capture and timing measurement in FH)
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (logging and durability)
 - `adr-004-real-time-analytics-computation.md` (RTE analytics)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (timing aggregation in TEL)
 - `adr-006-recovery-and-replay-strategy.md` (recovery and replay)
 - `adr-009-Order-Book-Architecture.md` (quote handler order book details)
-- `docs/specs/trades-schema.md` (trade table schema)
-- `docs/specs/quotes-schema.md` (quote table schema
+- `specs/trades-schema.md` (trade table schema)
+- `specs/quotes-schema.md` (quote table schema
