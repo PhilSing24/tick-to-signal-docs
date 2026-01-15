@@ -80,32 +80,22 @@ Draft available at [paper/Real_time_Crypto_KDB.pdf](paper/Real_time_Crypto_KDB.p
 
 ## Architecture: Divergences from Reference Patterns
 
-The system architecture is informed by the patterns described in *Building Real-Time Event-Driven KDB-X Systems* (Data Intellect). However, as an exploratory project optimized for learning and observability rather than enterprise-scale production, several conscious trade-offs were made.
-
 ### Acknowledged Trade-offs
 
 | Pattern | Reference Recommendation | Project Decision | Rationale |
 |---------|-------------------------|------------------|-----------|
 | **Batching** | Batch messages for throughput | Tick-by-tick publishing | Prioritizes latency measurement clarity over throughput |
 | **User isolation** | Separate UI cache layer | Direct queries to RDB/RTE/TEL | Acceptable for single-user development; simplifies architecture |
-| **Timer vs event-driven** | Event-driven processing preferred | Mixed (hot path event-driven, cold path timer-based) | Var-covar and cleanup are computationally expensive; timer-based is sufficient |
+| **Timer vs event-driven** | Event-driven processing preferred | Mixed (hot path event-driven, cold path timer-based) | Var-covar and cleanup are computationally expensive; timer-based makes sense |
 
 ### Patterns Not Implemented
 
 | Pattern | Reference Recommendation | Project Status | Impact |
 |---------|-------------------------|----------------|--------|
 | **FH local recovery log** | Feed handler maintains local log for replay after TP disconnect | Not implemented | Gaps during FH↔TP disconnect are permanent |
-| **Replicated feed handlers** | Multiple FH instances for resilience | Single instances | Single point of failure at ingestion boundary |
+| **Replicated feed handlers** | Multiple FH instances for resilience | Single instance | Single point of failure at ingestion boundary |
 | **Status propagation** | Pub/sub staleness cascade across components | Validity flags only (no automatic propagation) | Downstream must query validity rather than subscribe |
 | **Hot path separation** | Dedicated low-latency data flow via separate TP | Single TP for all data | All data treated uniformly; no latency-optimized path |
 | **GC tuning** | Configure `-g` parameter for latency profile | Not addressed | Default GC behavior; potential latency variability |
-
-### Design Philosophy
-
-These divergences reflect the project's goals:
-
-1. **Observability over throughput** — Tick-by-tick processing provides clearer latency measurement than batching
-2. **Simplicity over resilience** — Single-instance components are easier to reason about and debug
-3. **Explicit over automatic** — Validity flags require explicit checking rather than implicit propagation
 
 
