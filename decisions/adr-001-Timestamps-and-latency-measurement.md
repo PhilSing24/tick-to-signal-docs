@@ -260,7 +260,42 @@ SLOs should explicitly state:
 - If clock offset exceeds a defined threshold (e.g., >5ms), cross-host end-to-end latency measurements should be flagged as unreliable.
 - When cross-host latency is unreliable, rely on segment metrics (`fhParseUs`, `fhSendUs`) instead.
 
-### 7) Correlation and Deduplication
+### 7) Garbage Collection Configuration
+
+KDB-X garbage collection behavior affects latency volatility. All data-path processes are configured with deferred GC:
+```q
+system "g 0"   / Deferred GC - memory recycled internally
+```
+
+| Process | GC Mode | Rationale |
+|---------|---------|-----------|
+| TP | Deferred | High message throughput |
+| RDB | Deferred | Frequent inserts |
+| RTE | Deferred | Hot path updates + timer cleanup |
+| TEL | Deferred | Periodic queries and aggregation |
+| MLE | Deferred | Hot path accumulator updates |
+| CTL | Default | Low-frequency administrative |
+| LOG | Default | Low-frequency administrative |
+
+**Deferred GC (`-g 0`):**
+- Memory recycled internally, not returned to OS
+- Reduces latency spikes from OS memory operations
+- Memory usage grows but remains stable after warmup
+
+**Immediate GC (`-g 1`):**
+- Memory returned to OS after use
+- Higher latency variance
+- Lower peak memory usage
+
+Deferred GC is appropriate because:
+- Processes restart daily (EOD), resetting fragmentation
+- Tables are bounded by retention cleanup
+- Single-user system with moderate volume
+
+Reference: *Building Real-Time Event-Driven KDB-X Systems* §Performance Tuning: Memory
+
+
+### 8) Correlation and Deduplication
 
 #### Trade Events
 

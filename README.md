@@ -96,6 +96,5 @@ Draft available at [paper/Real_time_Crypto_KDB.pdf](paper/Real_time_Crypto_KDB.p
 | **Replicated feed handlers** | Multiple FH instances for resilience | Single instance | Single point of failure at ingestion boundary |
 | **Status propagation** | Pub/sub staleness cascade across components | Validity flags only (no automatic propagation) | Downstream must query validity rather than subscribe |
 | **Hot path separation** | Dedicated low-latency data flow via separate TP | Single TP for all data | All data treated uniformly; no latency-optimized path |
-| **GC tuning** | Configure `-g` parameter for latency profile | Not addressed | Default GC behavior; potential latency variability |
 
 
