@@ -12,7 +12,7 @@ This project ingests real-time Binance market data via WebSocket (JSON), normali
 
 **Feed Handlers:**
 - **Trade Feed Handler**: Ingests individual trade executions (simple 1:1 message flow)
-- **Quote Feed Handler**: Maintains L5 order book state from depth updates (stateful, complex processing)
+- **Quote Feed Handler**: Maintains L2 order book state from depth updates (stateful, complex processing)
 
 We need consistent timestamping to:
 - Measure latency within feed handlers reliably (parsing, normalisation, IPC send).
@@ -92,8 +92,8 @@ The sequence number is recommended (not optional) because it:
 - Provides ordering diagnostics independent of exchange IDs
 - Has negligible implementation cost
 
-#### Quote Events (L5 Order Book)
-For each L5 quote snapshot published, the feed handler captures:
+#### Quote Events (L2 Order Book)
+For each L2 quote snapshot published, the feed handler captures:
 
 **Upstream (from Binance depth update message):**
 
@@ -113,8 +113,8 @@ For each L5 quote snapshot published, the feed handler captures:
 
 | Field | Description | Unit |
 |-------|-------------|------|
-| `fhParseUs` | Duration for JSON parse + order book state update + L5 extraction | microseconds |
-| `fhSendUs` | Duration to build L5 snapshot and send via IPC | microseconds |
+| `fhParseUs` | Duration for JSON parse + order book state update + L2 extraction | microseconds |
+| `fhSendUs` | Duration to build L2 snapshot and send via IPC | microseconds |
 
 **Feed handler sequence number:**
 
@@ -124,8 +124,8 @@ For each L5 quote snapshot published, the feed handler captures:
 
 **Key differences between trade and quote handlers:**
 - Quote `fhParseUs` includes stateful order book management (significantly higher than trades)
-- Quote `fhSendUs` includes L5 snapshot construction (similar magnitude to trades)
-- Quote handler may publish multiple L5 snapshots per depth update due to change-based publishing logic
+- Quote `fhSendUs` includes L2 snapshot construction (similar magnitude to trades)
+- Quote handler may publish multiple L2 snapshots per depth update due to change-based publishing logic
 - Quote handler includes snapshot synchronization overhead (REST API fetch + buffered delta replay)
 
 **kdb-side timestamps (both trades and quotes):**
@@ -161,7 +161,7 @@ For this exploratory project, all timestamp and latency fields are stored **per-
 - `fhParseUs`
 - `fhSendUs`
 - `fhSeqNo`
-- L5 order book snapshot (bidPrice1-5, bidQty1-5, askPrice1-5, askQty1-5)
+- L2 order book snapshot (bidPrice1-5, bidQty1-5, askPrice1-5, askQty1-5)
 - `isValid` (order book synchronization status flag)
 - `tpRecvTimeUtcNs`
 - `rdbApplyTimeUtcNs`
@@ -186,8 +186,8 @@ Rationale for per-event storage:
 
 | Metric | Trade Handler | Quote Handler |
 |--------|---------------|---------------|
-| `fh_parse_us` | JSON parse + field extraction | JSON parse + order book update + L5 extraction |
-| `fh_send_us` | IPC message serialization | L5 snapshot construction + IPC serialization |
+| `fh_parse_us` | JSON parse + field extraction | JSON parse + order book update + L2 extraction |
+| `fh_send_us` | IPC message serialization | L2 snapshot construction + IPC serialization |
 
 **Expected latency ranges (p95, typical conditions):**
 - **Trade Handler:** parse ~20-50μs, send ~5-10μs
@@ -195,7 +195,7 @@ Rationale for per-event storage:
 
 Quote handler parse time is significantly higher due to:
 - Stateful order book management (apply bids/asks updates)
-- L5 extraction from full order book
+- L2 extraction from full order book
 - Change detection logic for publish throttling
 
 **Cross-process latencies (wall-clock-derived, trust depends on clock sync):**
@@ -211,7 +211,7 @@ All timestamps use nanoseconds since epoch. Unit conversions are explicit in for
 
 **Handler-specific considerations:**
 - Trade handler: 1 message in → 1 event out (simple flow)
-- Quote handler: 1 depth update in → 0-N L5 snapshots out (change-based publishing)
+- Quote handler: 1 depth update in → 0-N L2 snapshots out (change-based publishing)
 
 ### 5) SLO Expression and Aggregation Windows
 
@@ -281,17 +281,17 @@ SLOs should explicitly state:
 - (`sym`, `time`) - quotes are point-in-time snapshots, not distinct exchange events
 
 **Deduplication behaviour:**
-- Quote handler uses change-based publishing; duplicate L5 snapshots are suppressed by the feed handler.
+- Quote handler uses change-based publishing; duplicate L2 snapshots are suppressed by the feed handler.
 - If reconnect occurs, order book is reset and resynchronized via REST snapshot.
 
 **Gap detection:**
 - `fhSeqNo` gaps indicate missed publications at the feed handler level.
-- No exchange-provided sequence number for L5 snapshots (depth updates use `U`/`u` updateId ranges internally).
+- No exchange-provided sequence number for L2 snapshots (depth updates use `U`/`u` updateId ranges internally).
 - Order book synchronization state tracked via `isValid` flag.
 
 **Synchronization diagnostics:**
 - `isValid=0` indicates order book is not synchronized (INIT/SYNCING/INVALID states).
-- `isValid=1` indicates order book is VALID and L5 data is trustworthy.
+- `isValid=1` indicates order book is VALID and L2 data is trustworthy.
 - Latency metrics for `isValid=0` quotes may be excluded from SLO calculations.
 
 ## Consequences
@@ -320,14 +320,14 @@ SLOs should explicitly state:
 
 **Parse timing (`fhParseUs`):**
 - Starts when WebSocket message buffer is available
-- Ends when L5 extraction completes
-- Includes: JSON parse, order book state update, L5 extraction
+- Ends when L2 extraction completes
+- Includes: JSON parse, order book state update, L2 extraction
 - Does NOT include: snapshot fetch (initial sync only), publish decision logic
 
 **Send timing (`fhSendUs`):**
-- Starts after L5 extraction completes
+- Starts after L2 extraction completes
 - Ends when IPC send is initiated
-- Includes: L5 snapshot construction, kdb+ C API serialization
+- Includes: L2 snapshot construction, kdb+ C API serialization
 
 **Snapshot initialization:**
 - Initial REST snapshot fetch is NOT timed (one-time operation)

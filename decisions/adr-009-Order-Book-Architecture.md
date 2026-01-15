@@ -33,7 +33,7 @@ A decision is required on how to implement order book ingestion with correct rec
 
 **Update (2026-01-11):** Corrected logging section to align with ADR-003 (single log file per day).
 
-**Update (2026-01-14):** Standardized terminology to use "Level 2 (5 levels)" instead of "L5" for clarity.
+**Update (2026-01-14):** Standardized terminology to use "Level 2 (5 levels)"
 
 ## Notation
 

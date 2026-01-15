@@ -11,11 +11,11 @@ Updated: 2026-01-11
 
 The system ingests real-time market data from Binance via two C++ feed handlers:
 - **Trade Feed Handler**: Individual trade executions
-- **Quote Feed Handler**: L5 order book depth updates
+- **Quote Feed Handler**: L2 order book depth updates
 
 A core objective of the project is to compute **real-time analytics** on this live data:
 - **VWAP (Volume-Weighted Average Price)** from trades
-- **Order Book Imbalance** from L5 quotes (with EMA smoothing)
+- **Order Book Imbalance** from L2 quotes (with EMA smoothing)
 - **Variance-Covariance Matrix** from trades (cross-asset correlation)
 
 These analytics must:
@@ -35,7 +35,7 @@ A decision is required on **where and how these analytics are computed**.
 |---------|------------|
 | EMA | Exponential Moving Average |
 | IPC | Inter-Process Communication |
-| L5 | Level 5 (top 5 bid/ask levels) |
+| L2 | Level 2 (top 5 bid/ask levels) |
 | OBI | Order Book Imbalance |
 | RDB | Real-Time Database |
 | RTE | Real-Time Engine |
@@ -51,7 +51,7 @@ Real-time analytics will be computed in a **Real-Time Engine (RTE)** process usi
 | VWAP | Time-bucketed aggregation | 1-10 min | Hot (every trade) |
 | Order Book Imbalance | Latest + EMA smoothing | Point-in-time | Hot (every quote) |
 | OBI History | Rolling table | 7 min | Hot (every quote) |
-| L5 Order Book | Latest snapshot | Point-in-time | Hot (every quote) |
+| L2 Order Book | Latest snapshot | Point-in-time | Hot (every quote) |
 | Variance-Covariance | Resampled calculation | 1 hour | Cold (timer, 5s) |
 
 ### Architectural Placement
@@ -284,8 +284,8 @@ Imbalance = (bidDepth - askDepth) / (bidDepth + askDepth)
 ```
 
 Where:
-- `bidDepth = sum(bidQty1 through bidQty5)` (L5 total)
-- `askDepth = sum(askQty1 through askQty5)` (L5 total)
+- `bidDepth = sum(bidQty1 through bidQty5)` (L2 total)
+- `askDepth = sum(askQty1 through askQty5)` (L2 total)
 
 **Result Range:** -1.0 (all asks) to +1.0 (all bids)
 
@@ -310,7 +310,7 @@ smOBI = α × OBI + (1 - α) × prevSmOBI
 ```
 
 **Update Algorithm:**
-1. Incoming quote arrives with L5 data
+1. Incoming quote arrives with L2 data
 2. Calculate total bid depth: `bidDepth = sum of bidQty1-5`
 3. Calculate total ask depth: `askDepth = sum of askQty1-5`
 4. Calculate raw imbalance: `imb = (bidDepth - askDepth) / (bidDepth + askDepth)`
@@ -363,9 +363,9 @@ time                          OBI        smOBI
 
 ---
 
-### 5. L5 Order Book Snapshot
+### 5. L2 Order Book Snapshot
 
-**Purpose:** Store latest L5 order book for display (dashboard).
+**Purpose:** Store latest L2 order book for display (dashboard).
 
 **Implementation Strategy: Raw List Storage (Optimized for Hot Path)**
 
@@ -401,7 +401,7 @@ The order book is stored as a raw list to minimize allocation on the update path
 
 **Query Interface:**
 ```q
-/ Get L5 order book for display
+/ Get L2 order book for display
 .rte.getOrderBook[`BTCUSDT]
 
 / Returns 5-row table:
@@ -485,7 +485,7 @@ SOLUSDT 31.69         67.00      below
 
 **Order Book:**
 ```q
-.rte.getOrderBook[`BTCUSDT]            / L5 order book table
+.rte.getOrderBook[`BTCUSDT]            / L2 order book table
 .rte.getSpread[`BTCUSDT]               / Spread and mid-price
 .rte.getImbalance[`BTCUSDT]            / Order book imbalance (single symbol)
 .rte.getImbalanceAll[]                 / All symbols with pressure
@@ -647,7 +647,7 @@ Rejected:
 - Cross-asset correlation analysis (var-covar)
 - Smoothed OBI with pressure indicator
 - OBI history for trend analysis
-- L5 order book for dashboard
+- L2 order book for dashboard
 - Dashboard-optimized query functions
 - Efficient memory usage (~3MB total)
 - Hot path optimized (<1μs updates)

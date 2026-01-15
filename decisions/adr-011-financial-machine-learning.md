@@ -71,11 +71,11 @@ Dollar-based bars ensure:
 ### Architectural Placement
 
 ```
-TP ──┬──► RDB (storage: trade_binance, quote_binance)
+TP ──┬──► RDB : 5011 (storage: trade_binance, quote_binance)
      │
-     ├──► RTE (analytics: VWAP, Imbalance, VarCovar)
+     ├──► RTE : 5012 (analytics: VWAP, Imbalance, VarCovar)
      │
-     └──► MLE (ML features: DIB, DRB, Labels)
+     └──► MLE : 5015 (ML features: DIB, DRB, Labels)
 ```
 
 - The **MLE** subscribes directly to the tickerplant for live updates
