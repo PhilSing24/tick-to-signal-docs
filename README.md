@@ -80,6 +80,8 @@ Draft available at [paper/Real_time_Crypto_KDB.pdf](paper/Real_time_Crypto_KDB.p
 
 ## Architecture: Divergences from Reference Patterns
 
+The two tables describe the divergences with the pattern recommendation in Building Real-Time Event-Driven KDB-X Systems (Data Intellect).
+
 ### Acknowledged Trade-offs
 
 | Pattern | Reference Recommendation | Project Decision | Rationale |
