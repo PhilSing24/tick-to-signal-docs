@@ -86,7 +86,7 @@ The two tables describe the divergences with the pattern recommendation in Build
 
 | Pattern | Reference Recommendation | Project Decision | Rationale |
 |---------|-------------------------|------------------|-----------|
-| **Batching** | Batch messages for throughput | Tick-by-tick publishing | Prioritizes latency measurement over throughput |
+| **Batching** | Batch messages for throughput | Tick-by-tick publishing | Prioritizes latency over throughput |
 | **User isolation** | Separate UI cache layer | Direct queries to RDB/RTE/TEL | Acceptable for single-user development; simplifies architecture |
 | **Timer vs event-driven** | Event-driven processing preferred | Mixed (hot path event-driven, cold path timer-based) | Var-covar and cleanup are computationally expensive; timer-based makes sense |
 
