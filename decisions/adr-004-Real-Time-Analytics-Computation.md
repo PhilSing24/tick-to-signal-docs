@@ -1,11 +1,11 @@
 # ADR-004: Real-Time Analytics Computation
 
 ## Status
-Accepted (Updated 2026-01-11)
+Accepted (Updated 2026-01-16)
 
 ## Date
 Original: 2025-12-17
-Updated: 2026-01-11
+Updated: 2026-01-11, 2026-01-16
 
 ## Context
 
@@ -36,11 +36,12 @@ A decision is required on **where and how these analytics are computed**.
 | EMA | Exponential Moving Average |
 | IPC | Inter-Process Communication |
 | L2 | Level 2 (top 5 bid/ask levels) |
+| MLE | Machine Learning Engine |
 | OBI | Order Book Imbalance |
-| RDB | Real-Time Database |
 | RTE | Real-Time Engine |
 | TP | Tickerplant |
 | VWAP | Volume-Weighted Average Price |
+| WDB | Write-only Database (intraday writedown to HDB) |
 
 ## Decision
 
@@ -56,20 +57,22 @@ Real-time analytics will be computed in a **Real-Time Engine (RTE)** process usi
 
 ### Architectural Placement
 
-- The **RDB** stores raw trade and quote events and provides query-consistent access.
+- The **WDB** stores raw trade and quote events and writes to HDB.
 - The **RTE** computes and maintains analytics as a dedicated process.
-- The RTE is a peer to the RDB, not downstream of it during normal operation.
+- The RTE is a peer to the WDB, not downstream of it during normal operation.
 
 ### Subscription Model
 
 - The RTE subscribes **directly to the tickerplant** for live updates.
-- The RTE is a peer subscriber alongside the RDB.
-- The RTE does not query the RDB during normal operation (only for recovery).
+- The RTE is a peer subscriber alongside the WDB and MLE.
+- The RTE does not query the WDB during normal operation (only for recovery).
 
 ```
-TP ──┬──► RDB (storage: trade_binance, quote_binance)
-     │
-     └──► RTE (analytics: VWAP, Imbalance, VarCovar)
+TP:5010 ──┬──► WDB:5012 (storage: trade_binance, quote_binance → HDB)
+          │
+          ├──► RTE:5013 (analytics: VWAP, Imbalance, VarCovar)
+          │
+          └──► MLE:5015 (information-driven bars: DIB, DRB)
 ```
 
 ### Processing Mode
@@ -266,152 +269,102 @@ SOLUSDT| 0.317
 - Requires ~50 minutes warm-up for valid 1-hour calculation
 - Matrix is computed but flagged invalid during warm-up
 
-**Annualization Factor:**
-```q
-/ Seconds per year / bucket size = periods per year
-/ 31,536,000 / 30 = 1,051,200
-factor: 31536000 % .rte.cfg.vcovBucketSec
-annualVol: sqrt factor * variance
-```
-
 ---
 
-### 4. Order Book Imbalance with EMA Smoothing
+### 4. Order Book Imbalance (OBI)
+
+**Purpose:** Measure buying vs selling pressure from L2 depth.
 
 **Formula:**
 ```
-Imbalance = (bidDepth - askDepth) / (bidDepth + askDepth)
+OBI = (bidDepth - askDepth) / (bidDepth + askDepth)
+```
+Where depth = sum of quantities across 5 levels.
+
+**Range:** -1 (all asks) to +1 (all bids), 0 = balanced
+
+**EMA Smoothing:**
+Raw OBI is noisy; we apply Exponential Moving Average:
+```
+smOBI[t] = α × OBI[t] + (1 - α) × smOBI[t-1]
 ```
 
-Where:
-- `bidDepth = sum(bidQty1 through bidQty5)` (L2 total)
-- `askDepth = sum(askQty1 through askQty5)` (L2 total)
-
-**Result Range:** -1.0 (all asks) to +1.0 (all bids)
-
-**Implementation Strategy: Latest Snapshot + EMA Smoothing + History**
-
-Raw OBI is noisy (updates 10-30x per second). EMA smoothing provides stability:
-
-```
-smOBI = α × OBI + (1 - α) × prevSmOBI
+**Configuration:**
+```q
+.rte.cfg.obiAlpha:0.05;        / Lower = smoother (5% weight to new value)
+.rte.cfg.obiThreshold:0.3;     / Threshold for buyer/seller pressure
+.rte.cfg.obiRetentionMin:7;    / Keep 7 minutes of history
 ```
 
 **Data Structures:**
 ```q
-/ Latest imbalance per symbol
-.rte.imb.latest:()!();  / sym → (bidDepth, askDepth, imbalance, smOBI, time)
-
-/ EMA state per symbol
-.rte.imb.ema:()!();     / sym → smOBI
-
-/ History for charting
-.rte.imb.history:([] time:`timestamp$(); sym:`symbol$(); OBI:`float$(); smOBI:`float$())
-```
-
-**Update Algorithm:**
-1. Incoming quote arrives with L2 data
-2. Calculate total bid depth: `bidDepth = sum of bidQty1-5`
-3. Calculate total ask depth: `askDepth = sum of askQty1-5`
-4. Calculate raw imbalance: `imb = (bidDepth - askDepth) / (bidDepth + askDepth)`
-5. Calculate smoothed OBI: `smOBI = α × imb + (1 - α) × prevSmOBI`
-6. Store in latest dictionary and append to history
-7. This is **O(1)** - dictionary update + table append
-
-**Configuration:**
-```q
-.rte.cfg.obiAlpha:0.05;          / EMA smoothing factor (lower = smoother)
-.rte.cfg.obiThreshold:0.3;       / Threshold for buyer/seller pressure
-.rte.cfg.obiRetentionMin:7;      / Keep 7 minutes of history
+.rte.imb.latest    / Latest OBI per symbol (dict)
+.rte.imb.ema       / EMA state per symbol (dict)
+.rte.imb.history   / Rolling history table
 ```
 
 **Pressure Classification:**
-- `smOBI > +0.3`: buyer pressure
-- `smOBI < -0.3`: seller pressure  
-- Otherwise: neutral
+| smOBI | Pressure |
+|-------|----------|
+| > 0.3 | `buyer` |
+| < -0.3 | `seller` |
+| else | `neutral` |
 
 **Query Interface:**
 ```q
-/ Get latest imbalance for BTCUSDT
+/ Single symbol
 .rte.getImbalance[`BTCUSDT]
 
-/ Returns single-row table:
-sym     bidDepth askDepth imbalance smOBI  time
-------------------------------------------------
-BTCUSDT 15.2     12.8     0.086     0.042  ...
-
-/ Get all symbols with pressure indicator
+/ All symbols with pressure
 .rte.getImbalanceAll[]
 
 / Returns:
 sym     OBI    smOBI  pressure
 ------------------------------
-BTCUSDT 0.42   0.18   neutral
-ETHUSDT -0.35  -0.31  seller
-SOLUSDT 0.15   0.33   buyer
+BTCUSDT 0.15   0.22   neutral
+ETHUSDT 0.45   0.38   buyer
+SOLUSDT -0.32  -0.28  neutral
 
-/ Get OBI history for charting
-.rte.getOBIHistory[`BTCUSDT; 5]
-
-/ Returns:
-time                          OBI        smOBI
-----------------------------------------------
-2026.01.11D11:13:07.021717967 -0.45      -0.32
-2026.01.11D11:13:07.102643622 -0.42      -0.31
-...
+/ History for charting
+.rte.getOBIHistory[`BTCUSDT; 5]  / Last 5 minutes
 ```
 
 ---
 
-### 5. L2 Order Book Snapshot
+### 5. L2 Order Book State
 
-**Purpose:** Store latest L2 order book for display (dashboard).
+**Purpose:** Maintain latest L2 snapshot for dashboard display.
 
-**Implementation Strategy: Raw List Storage (Optimized for Hot Path)**
+**Storage Strategy: Raw List (Hot Path Optimized)**
 
-The order book is stored as a raw list to minimize allocation on the update path:
-
-**Data Structure:**
+The order book is stored as a **raw list** for minimal update overhead:
 ```q
-/ Stored as raw list for minimal update overhead:
-/   Indices 0-4:   bidPrice1-5
-/   Indices 5-9:   bidQty1-5
-/   Indices 10-14: askPrice1-5
-/   Indices 15-19: askQty1-5
-/   Index 20:      time
-.rte.book.latest:()!();  / Dictionary: sym → list[21]
+.rte.book.latest[`BTCUSDT]
+/ Indices 0-4:   bidPrice1-5
+/ Indices 5-9:   bidQty1-5
+/ Indices 10-14: askPrice1-5
+/ Indices 15-19: askQty1-5
+/ Index 20:      time
 ```
 
-**Hot Path vs Cold Path Design:**
-- **Hot path** (update, 10-30x/sec): Store raw list, single vector slice
-- **Cold path** (query, 1x/sec): Format to table on demand
-
+**Update (Hot Path):**
 ```q
-/ Hot path - O(1), minimal allocation
 .rte.book.update:{[s;data;time]
   .rte.book.latest[s]:data[2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21],time;
   };
-
-/ Cold path - formatting done at query time
-.rte.getOrderBook:{[s]
-  d:.rte.book.latest[s];
-  ([] bidQty:d 5 6 7 8 9; bidPrice:d 0 1 2 3 4; askPrice:d 10 11 12 13 14; askQty:d 15 16 17 18 19)
-  };
 ```
 
-**Query Interface:**
+**Query (Cold Path - Formatted for Display):**
 ```q
-/ Get L2 order book for display
 .rte.getOrderBook[`BTCUSDT]
 
-/ Returns 5-row table:
-bidQty   bidPrice askPrice askQty
----------------------------------
-0.5      90700    90701    0.3
-0.8      90699    90702    0.6
+/ Returns table:
+bidQty   bidPrice  askPrice  askQty
+-----------------------------------
+0.5      90700     90701     0.3
+1.2      90699     90702     0.8
 ...
 
-/ Get spread and mid-price
 .rte.getSpread[`BTCUSDT]
 
 / Returns:

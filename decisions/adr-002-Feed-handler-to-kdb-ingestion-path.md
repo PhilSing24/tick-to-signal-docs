@@ -1,26 +1,26 @@
 # ADR-002: Feed Handler to kdb Ingestion Path
 
 ## Status
-Accepted (Updated 2026-01-06)
+Accepted (Updated 2026-01-16)
 
 ## Date
 Original: 2025-12-17
-Updated: 2026-01-03, 2026-01-06
+Updated: 2026-01-03, 2026-01-06, 2026-01-16
 
 ## Context
 
 This project ingests real-time Binance market data via WebSocket in C++ feed handlers and publishes it into a kdb+/KDB-X environment for real-time analytics.
 
 Two data types are ingested:
-- **Trade data** – Individual trade executions from the trade stream
-- **Quote data** – L2 order book depth (5 levels of bid/ask) derived from depth stream
+- **Trade data** — Individual trade executions from the trade stream
+- **Quote data** — L2 order book depth (5 levels of bid/ask) derived from depth stream
 
 There are multiple technically valid ingestion paths from an external feed handler into kdb, including:
 
 - Direct publication into a Tickerplant via IPC
 - Writing to intermediate logs or files for later ingestion
 - Embedding q/kdb within the feed handler process
-- Publishing directly into an RDB
+- Publishing directly into a WDB
 - Using alternative transports (message queues, streaming platforms, etc.)
 
 Each option represents different trade-offs in terms of latency, complexity, observability, resilience, and alignment with established kdb architectures.
@@ -32,11 +32,14 @@ This project is explicitly inspired by the *Building Real Time Event Driven KDB-
 | Acronym | Definition |
 |---------|------------|
 | FH | Feed Handler |
+| HDB | Historical Database |
 | IPC | Inter-Process Communication |
 | L2 |  Level 2 market depth (5 price levels per side) |
-| RDB | Real-Time Database |
+| MLE | Machine Learning Engine |
 | RTE | Real-Time Engine |
+| TEL | Telemetry |
 | TP | Tickerplant |
+| WDB | Write-only Database (intraday writedown to HDB) |
 
 ## Decision
 
@@ -45,9 +48,11 @@ Both feed handlers publish data **directly into a single Tickerplant via IPC**.
 ### Architecture
 
 ```
-Binance Trade Stream ──► Trade FH ──┬──► TP:5010 ──┬──► RDB (trades + quotes)
-                                    │              ├──► RTE (VWAP + imbalance)
-Binance Depth Stream ──► Quote FH ──┘              └──► Logs (both)
+Binance Trade Stream ──► Trade FH ──┬──► TP:5010 ──┬──► WDB:5012 (writes to HDB)
+                                    │              ├──► RTE:5013 (VWAP, vol, OBI)
+Binance Depth Stream ──► Quote FH ──┘              ├──► MLE:5015 (DIB/DRB bars, trades only)
+                                                   ├──► TEL:5014 (health monitoring)
+                                                   └──► Logs (both)
 ```
 
 ### Feed Handler Design
@@ -111,7 +116,7 @@ The quote feed handler is **stateful** and maintains **L2 order book state**:
 - Normalised events are published as update messages to the tickerplant
 - The tickerplant remains the single ingress point for:
   - Logging (separate files per data type, see ADR-003)
-  - Fan-out to subscribers (RDB, RTE)
+  - Fan-out to subscribers (WDB, RTE, MLE, TEL)
   - Time-ordering and sequencing
   - Adding `tpRecvTimeUtcNs` timestamp
 
@@ -170,15 +175,15 @@ neg[h] (`.u.upd; `quote_binance; quoteData)
 
 ### Tables Published
 
-| Table | Source | FH Fields | TP Adds | RDB Adds | Total | Subscribers |
+| Table | Source | FH Fields | TP Adds | WDB Adds | Total | Subscribers |
 |-------|--------|-----------|---------|----------|-------|-------------|
-| `trade_binance` | Trade FH | 12 | 1 | 1 | 14 | RDB, RTE |
-| `quote_binance` | Quote FH | 28 | 1 | 1 | 30 | RDB, RTE |
+| `trade_binance` | Trade FH | 12 | 1 | 1 | 14 | WDB, RTE, MLE |
+| `quote_binance` | Quote FH | 28 | 1 | 1 | 30 | WDB, RTE |
 
 **Trade Schema (14 fields total)**:
 - **FH sends (12)**: `time`, `sym`, `tradeId`, `price`, `qty`, `buyerIsMaker`, `exchEventTimeMs`, `exchTradeTimeMs`, `fhRecvTimeUtcNs`, `fhParseUs`, `fhSendUs`, `fhSeqNo`
 - **TP adds (1)**: `tpRecvTimeUtcNs`
-- **RDB adds (1)**: `rdbApplyTimeUtcNs`
+- **WDB adds (1)**: `wdbRecvTimeUtcNs`
 
 **Quote L2 Schema (30 fields total)**:
 - **FH sends (28)**: 
@@ -187,7 +192,7 @@ neg[h] (`.u.upd; `quote_binance; quoteData)
   - `askPrice1-5`, `askQty1-5` (10 fields)
   - `isValid`, `exchEventTimeMs`, `fhRecvTimeUtcNs`, `fhParseUs`, `fhSendUs`, `fhSeqNo`
 - **TP adds (1)**: `tpRecvTimeUtcNs`
-- **RDB adds (1)**: `rdbApplyTimeUtcNs`
+- **WDB adds (1)**: `wdbRecvTimeUtcNs`
 
 **Key differences from original ADR**:
 - Added `fhParseUs` and `fhSendUs` to both schemas (2026-01-06)
@@ -217,8 +222,9 @@ This option was selected because it:
 - Preserves a clear separation of concerns:
   - Feed handlers: external I/O, parsing, normalisation, timestamp capture (ADR-001)
   - Tickerplant: sequencing, publication, logging (ADR-003)
-  - RDB: storage and query consistency
+  - WDB: intraday storage and HDB persistence
   - RTE: derived analytics (ADR-004)
+  - MLE: information-driven bars (trades only)
 - Minimises end-to-end latency by avoiding intermediate persistence layers
 - Keeps operational complexity low for an exploratory but realistic system
 - Allows later evolution (e.g., replication, recovery) without changing the feed handler contract
@@ -249,7 +255,7 @@ Including `fhParseUs` and `fhSendUs` in every message was selected because:
 - No separate telemetry channel needed
 - Minimal overhead (2 long fields)
 - Simplifies implementation (single message path)
-- Raw data available in RDB for debugging
+- Raw data available in WDB for debugging
 - Aligns with exploratory project goals
 
 ## Alternatives Considered
@@ -266,7 +272,7 @@ Rejected because:
 - Complicates deployment and debugging
 - Reduces architectural clarity
 
-### 3. Publishing Directly to an RDB
+### 3. Publishing Directly to a WDB
 Rejected because:
 - Bypasses the tickerplant's role in sequencing and fan-out
 - Makes scaling and recovery more difficult
@@ -327,7 +333,7 @@ Rejected because:
 - Single TP simplifies subscriber management
 - L2 depth enables richer analytics (imbalance across levels)
 - Per-event timing enables detailed latency analysis
-- Raw timing data available in RDB for debugging
+- Raw timing data available in WDB for debugging
 - Both handlers instrumented consistently
 
 ### Negative / Trade-offs
@@ -371,4 +377,4 @@ These measurements validate the architectural decision to instrument both handle
 - `adr-006-recovery-and-replay-strategy.md` (recovery and replay)
 - `adr-009-Order-Book-Architecture.md` (quote handler order book details)
 - `specs/trades-schema.md` (trade table schema)
-- `specs/quotes-schema.md` (quote table schema
+- `specs/quotes-schema.md` (quote table schema)

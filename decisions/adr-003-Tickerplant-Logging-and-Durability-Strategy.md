@@ -1,18 +1,18 @@
 # ADR-003: Tickerplant Logging and Durability Strategy
 
 ## Status
-Accepted (Updated 2026-01-09)
+Accepted (Updated 2026-01-16)
 
 ## Date
 Original: 2025-12-17
-Updated: 2025-12-29, 2026-01-06, 2026-01-09
+Updated: 2025-12-29, 2026-01-06, 2026-01-09, 2026-01-16
 
 ## Context
 
 In a canonical kdb real-time architecture, the tickerplant (TP) is responsible for:
 
 - Sequencing inbound events
-- Publishing updates to real-time databases (RDBs)
+- Publishing updates to subscribers (WDB, RTE, MLE)
 - Optionally providing a durability boundary via logging
 
 This project ingests real-time Binance market data:
@@ -29,10 +29,11 @@ A key design decision is whether and how the tickerplant should log incoming upd
 | FH | Feed Handler |
 | HDB | Historical Database |
 | IPC | Inter-Process Communication |
-| RDB | Real-Time Database |
+| MLE | Machine Learning Engine |
 | RTE | Real-Time Engine |
 | TEL | Telemetry Process |
 | TP | Tickerplant |
+| WDB | Write-only Database (intraday writedown to HDB) |
 
 ## Decision
 
@@ -105,15 +106,16 @@ Quote FH ───┘
 
 - Log rotation occurs at midnight (new date = new file)
 - `.tp.rotate[]` function closes old handle, opens new
-- No Historical Database (HDB) implemented
-- Logs are retained for replay/debugging but not persisted to HDB
+- WDB writes data to HDB partitions during intraday and at EOD
+- Logs are retained for replay/debugging
 
 ### Downstream Recovery Implications
 
 | Component | On Restart | Recovery Source |
 |-----------|------------|-----------------|
-| RDB | Starts empty | Replay from log |
+| WDB | Starts empty | Replay from log |
 | RTE | State lost | Replay from log (then cleanup) |
+| MLE | State lost | Replay from log |
 | TEL | State lost | Rebuilds from subscriptions + queries |
 | TP | Logs reset | N/A |
 
@@ -121,11 +123,11 @@ Quote FH ───┘
 
 | Table | Logged? | Subscribers |
 |-------|---------|-------------|
-| `trade_binance` | ✅ Yes | RDB, RTE |
-| `quote_binance` | ✅ Yes | RDB, RTE |
+| `trade_binance` | ✅ Yes | WDB, RTE, MLE |
+| `quote_binance` | ✅ Yes | WDB, RTE |
 | `health_feed_handler` | ❌ No (ephemeral) | TEL |
 
-**Note:** Both RDB and RTE subscribe to both trades and quotes.
+**Note:** WDB and RTE subscribe to both trades and quotes. MLE subscribes to trades only.
 
 ## Rationale
 
@@ -142,7 +144,7 @@ A single log file was selected because:
 ### 1. Separate log files per table (previous design)
 Rejected (2026-01-09):
 - Breaks chronological order during replay
-- RDB replays all trades, then all quotes (wrong order)
+- WDB replays all trades, then all quotes (wrong order)
 - RTE state incorrect during replay
 - Complicates point-in-time recovery
 
@@ -196,14 +198,14 @@ These trade-offs are acceptable for temporal consistency.
 Replay uses standard `-11!` streaming execute:
 ```bash
 # Replay all data for a date
-q kdb/rdb.q   # Auto-replays on startup
+q kdb/wdb.q   # Auto-replays on startup
 
 # Manual replay
 q
-.rdb.replay[2025.12.29]
+.wdb.replay[2025.12.29]
 ```
 
-**Note:** RTE also auto-replays on startup, then runs cleanup to keep only the retention window.
+**Note:** RTE and MLE also auto-replay on startup, then run cleanup to keep only the retention window.
 
 ## Links / References
 

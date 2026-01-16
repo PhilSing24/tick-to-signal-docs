@@ -1,15 +1,15 @@
 # ADR-005: Telemetry and Metrics Aggregation Strategy
 
 ## Status
-Accepted (Updated 2026-01-14)
+Accepted (Updated 2026-01-16)
 
 ## Date
 Original: 2025-12-17
-Updated: 2026-01-05, 2026-01-06, 2026-01-07, 2026-01-14
+Updated: 2026-01-05, 2026-01-06, 2026-01-07, 2026-01-14, 2026-01-16
 
 ## Context
 
-The system ingests real-time market data from Binance via two C++ feed handlers and publishes them into a kdb+/KDB-X pipeline (Tickerplant -> RDB -> RTE):
+The system ingests real-time market data from Binance via two C++ feed handlers and publishes them into a kdb+/KDB-X pipeline (Tickerplant -> WDB -> HDB, RTE, MLE):
 - **Trade Feed Handler**: Processes individual trade executions
 - **Quote Feed Handler**: Maintains L5 order book snapshots from depth updates
 
@@ -22,7 +22,7 @@ To understand system behaviour, diagnose issues, and validate latency targets, w
 
 ADR-001 defines raw timestamp fields captured per event:
 - `fhParseUs`, `fhSendUs` - feed handler segment latencies (both handlers)
-- `fhRecvTimeUtcNs`, `tpRecvTimeUtcNs`, `rdbApplyTimeUtcNs` - wall-clock timestamps for cross-process correlation
+- `fhRecvTimeUtcNs`, `tpRecvTimeUtcNs`, `wdbRecvTimeUtcNs` - wall-clock timestamps for cross-process correlation
 
 A decision is required on **how these raw measurements are aggregated, stored, and consumed**, with support for multiple handler types.
 
@@ -31,20 +31,22 @@ A decision is required on **how these raw measurements are aggregated, stored, a
 | Acronym | Definition |
 |---------|------------|
 | FH | Feed Handler |
+| HDB | Historical Database |
 | IPC | Inter-Process Communication |
-| RDB | Real-Time Database |
+| MLE | Machine Learning Engine |
 | RTE | Real-Time Engine |
 | SLO | Service-Level Objective |
 | TEL | Telemetry Process |
 | TP | Tickerplant |
+| WDB | Write-only Database (intraday writedown to HDB) |
 
 ## Decision
 
-Telemetry will be collected as **raw per-event measurements** and **aggregated in a dedicated TEL process** that queries RDB and RTE using **persistent IPC handles**, and subscribes to health updates via TP.
+Telemetry will be collected as **raw per-event measurements** and **aggregated in a dedicated TEL process** that queries WDB and RTE using **persistent IPC handles**, and subscribes to health updates via TP.
 
 ### Persistent IPC Handles (Added 2026-01-07)
 
-TEL queries RDB and RTE every 5 seconds for telemetry data. To minimize overhead, TEL maintains **persistent IPC connections** rather than opening/closing connections each query cycle.
+TEL queries WDB and RTE every 5 seconds for telemetry data. To minimize overhead, TEL maintains **persistent IPC connections** rather than opening/closing connections each query cycle.
 
 **Handle Management:**
 ```q
@@ -90,11 +92,11 @@ TEL queries RDB and RTE every 5 seconds for telemetry data. To minimize overhead
 
 | Category | Metrics | Source |
 |----------|---------|--------|
-| FH segment latencies | `fhParseUs`, `fhSendUs` per handler | Per-event fields from FH (via RDB query) |
-| Pipeline latencies | `fh_to_tp_ms`, `tp_to_rdb_ms`, `e2e_system_ms` | Derived from wall-clock timestamps (via RDB query, trades and quotes) |
+| FH segment latencies | `fhParseUs`, `fhSendUs` per handler | Per-event fields from FH (via WDB query) |
+| Pipeline latencies | `fh_to_tp_ms`, `tp_to_wdb_ms`, `e2e_system_ms` | Derived from wall-clock timestamps (via WDB query, trades and quotes) |
 | Throughput | Events per second, per symbol, per handler | Derived from `cnt` field in latency tables |
 | FH health | `uptimeSec`, `msgsReceived`, `connState` per handler | Published by FH → TP → TEL (subscription) |
-| System metrics | Memory usage per process | Queried from RDB, RTE, captured from TEL |
+| System metrics | Memory usage per process | Queried from WDB, RTE, captured from TEL |
 
 ### Aggregation Location
 
@@ -104,39 +106,43 @@ TEL queries RDB and RTE every 5 seconds for telemetry data. To minimize overhead
 |-----------|----------------|
 | Trade FH | Captures `fhParseUs`, `fhSendUs` per trade; publishes trades and health to TP |
 | Quote FH | Captures `fhParseUs`, `fhSendUs` per L5 snapshot; publishes quotes and health to TP |
-| TP | Distributes trades/quotes to RDB, health to TEL; adds `tpRecvTimeUtcNs` |
-| RDB | Stores raw trade/quote events with `rdbApplyTimeUtcNs`; serves queries |
+| TP | Distributes trades/quotes to WDB, health to TEL; adds `tpRecvTimeUtcNs` |
+| WDB | Stores raw trade/quote events with `wdbRecvTimeUtcNs`; serves queries; writes to HDB |
 | RTE | Computes VWAP/imbalance from market data; serves memory queries |
-| TEL | Subscribes to health via TP; queries RDB and RTE on timer (persistent handles); computes aggregated telemetry |
+| MLE | Computes information-driven bars (DIB/DRB) from trades |
+| TEL | Subscribes to health via TP; queries WDB and RTE on timer (persistent handles); computes aggregated telemetry |
 | Dashboard | Queries TEL for all monitoring data |
 
 Rationale:
-- RDB remains focused on market data storage (single responsibility)
+- WDB remains focused on market data storage and HDB writedown (single responsibility)
 - RTE remains focused on analytics (single responsibility)
+- MLE remains focused on ML feature engineering (single responsibility)
 - TEL is the single source of truth for all monitoring/telemetry
 - Health data flows through TP (consistent pub/sub pattern)
-- TEL can query multiple sources (RDB + RTE) for comprehensive metrics
+- TEL can query multiple sources (WDB + RTE) for comprehensive metrics
 - **Persistent handles minimize query overhead**
 - Telemetry logic can evolve without affecting storage or analytics
-- Raw per-event latencies remain available in RDB for debugging
+- Raw per-event latencies remain available in WDB for debugging
 - Dashboards query only TEL for system monitoring (single endpoint)
 - Handler-specific metrics enable performance comparison
 
 ### Collection Architecture
 
 ```
-Trade FH ---> TP :5010 --+--> RDB :5011 (trade_binance, quote_binance)
+Trade FH ---> TP :5010 --+--> WDB :5012 (trade_binance, quote_binance → HDB)
 Quote FH -------^        |
-                         +--> RTE :5012 (tradeBuckets, .rte.imb.latest)
+                         +--> RTE :5013 (tradeBuckets, .rte.imb.latest)
                          |
-                         +--> TEL :5013 (health_feed_handler subscription)
+                         +--> MLE :5015 (dib_bars, drb_bars)
+                         |
+                         +--> TEL :5014 (health_feed_handler subscription)
                                   |
-                                  +-- queries RDB via persistent handle
+                                  +-- queries WDB via persistent handle
                                   +-- queries RTE via persistent handle
                                   |
                                   +-- telemetry_latency_fh (unified: trade + quote)
                                   +-- telemetry_latency_e2e (trades and quotes)
-                                  +-- telemetry_system (RDB, RTE, TEL memory)
+                                  +-- telemetry_system (WDB, RTE, TEL memory)
                                   +-- health_feed_handler (from TP subscription)
 ```
 
@@ -184,10 +190,10 @@ Quote FH -------^        |
 | `fhToTpMs_p50` | float | Median FH to TP latency (ms) |
 | `fhToTpMs_p95` | float | 95th percentile FH to TP latency |
 | `fhToTpMs_max` | float | Maximum FH to TP latency |
-| `tpToRdbMs_p50` | float | Median TP to RDB latency (ms) |
-| `tpToRdbMs_p95` | float | 95th percentile TP to RDB latency |
-| `tpToRdbMs_max` | float | Maximum TP to RDB latency |
-| `e2eMs_p50` | float | Median end-to-end latency (FH to RDB) |
+| `tpToWdbMs_p50` | float | Median TP to WDB latency (ms) |
+| `tpToWdbMs_p95` | float | 95th percentile TP to WDB latency |
+| `tpToWdbMs_max` | float | Maximum TP to WDB latency |
+| `e2eMs_p50` | float | Median end-to-end latency (FH to WDB) |
 | `e2eMs_p95` | float | 95th percentile E2E latency |
 | `e2eMs_max` | float | Maximum E2E latency |
 | `cnt` | long | Number of events in bucket |
@@ -197,7 +203,7 @@ Quote FH -------^        |
 | Column | Type | Description |
 |--------|------|-------------|
 | `bucket` | timestamp | Start of 5-second bucket |
-| `component` | symbol | Process name (`RDB`, `RTE`, `TEL`) |
+| `component` | symbol | Process name (`WDB`, `RTE`, `TEL`) |
 | `heapMB` | float | Heap size (megabytes) |
 | `usedMB` | float | Memory used (megabytes) |
 | `peakMB` | float | Peak memory (megabytes) |
@@ -241,8 +247,8 @@ TEL provides handle status for debugging:
 / Returns:
 / port  handle status
 / ---------------------
-/ 5011  8      connected
-/ 5012  9      connected
+/ 5012  8      connected
+/ 5013  9      connected
 ```
 
 ### Dashboard View Functions
@@ -289,14 +295,15 @@ Dashboards query RTE directly for analytics health indicators.
 
 This approach was selected because it:
 
-- Keeps the RDB focused on market data storage (single responsibility)
+- Keeps the WDB focused on market data storage and HDB writedown (single responsibility)
 - Keeps the RTE focused on analytics (single responsibility)
+- Keeps the MLE focused on ML feature engineering (single responsibility)
 - Makes TEL the single source of truth for all monitoring
 - Uses consistent pub/sub pattern for health (FH → TP → TEL)
 - **Persistent handles minimize IPC overhead** (2026-01-07)
 - Centralises telemetry logic in TEL where it can evolve easily
-- Allows TEL to query multiple sources (RDB + RTE)
-- Preserves raw per-event latencies in RDB for debugging
+- Allows TEL to query multiple sources (WDB + RTE)
+- Preserves raw per-event latencies in WDB for debugging
 - Provides aggregated views suitable for dashboards
 - Aligns with the ephemeral, exploratory nature of the project
 - Uses 5-second buckets for stable percentiles with sufficient samples
@@ -314,7 +321,7 @@ Changed (2026-01-07):
 - File descriptor churn
 - Persistent handles are simple and more efficient
 
-### 2. Telemetry computed in RDB
+### 2. Telemetry computed in WDB
 Rejected:
 - Mixed storage and computation responsibilities
 - Could not easily capture RTE health metrics
@@ -342,13 +349,13 @@ Rejected:
 
 ### Positive
 
-- Clean separation of concerns (RDB stores market data, RTE computes analytics, TEL handles all monitoring)
+- Clean separation of concerns (WDB stores market data, RTE computes analytics, TEL handles all monitoring)
 - TEL is single source of truth for monitoring (dashboards query one endpoint for telemetry)
 - **Persistent handles eliminate connection overhead** (2026-01-07)
 - Automatic reconnection on connection loss
 - Health uses consistent pub/sub pattern (FH → TP → TEL)
-- Flexible aggregation logic (evolves in TEL without affecting RDB/RTE)
-- Raw data available in RDB for debugging
+- Flexible aggregation logic (evolves in TEL without affecting WDB/RTE)
+- Raw data available in WDB for debugging
 - Aggregated data available in TEL for dashboards
 - Consistent ephemeral stance
 - SLO metrics directly queryable

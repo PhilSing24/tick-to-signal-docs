@@ -1,16 +1,17 @@
 # ADR-007: Visualisation and Consumption Strategy
 
 ## Status
-Accepted (Updated 2026-01-14)
+Accepted (Updated 2026-01-16)
 
 ## Date
-2025-12-17 (Updated 2025-12-19, 2026-01-14)
+2025-12-17 (Updated 2025-12-19, 2026-01-14, 2026-01-16)
 
 ## Context
 
 The system produces:
 - Real-time market data (Binance trades and quotes)
 - Derived analytics (VWAP, order book imbalance, variance-covariance)
+- ML features (DIB, DRB bars, labels)
 - Telemetry and latency metrics
 
 These outputs must be:
@@ -35,10 +36,11 @@ A decision is required on how system outputs are visualised and consumed.
 |---------|------------|
 | FH | Feed Handler |
 | IPC | Inter-Process Communication |
-| RDB | Real-Time Database |
+| MLE | Machine Learning Engine |
 | RTE | Real-Time Engine |
 | TEL | Telemetry Process |
 | TP | Tickerplant |
+| WDB | Write-only Database (intraday writedown to HDB) |
 
 ## Decision
 
@@ -83,35 +85,40 @@ Polling is appropriate because:
 
 Rationale:
 - Acceptable responsiveness for development use
-- Minimal query load on RDB/RTE/TEL
+- Minimal query load on WDB/RTE/MLE/TEL
 - Note: TEL buckets are 5 seconds, so telemetry data updates every 5s regardless
 
 ### Query Targets
 
-Dashboards query **RDB, RTE, and TEL**:
+Dashboards query **WDB, RTE, MLE, and TEL**:
 
 ```
-              +---> RDB :5011 (raw trades, quotes)
+              +---> WDB :5012 (raw trades, quotes)
               |
-Dashboard ----+---> RTE :5012 (VWAP, imbalance, var-covar, analytics validity)
+Dashboard ----+---> RTE :5013 (VWAP, imbalance, var-covar, analytics validity)
               |
-              +---> TEL :5013 (latency telemetry, FH health, system metrics)
+              +---> MLE :5015 (DIB, DRB bars, labels)
+              |
+              +---> TEL :5014 (latency telemetry, FH health, system metrics)
 ```
 
 | Data | Source | Port | Table/Query |
 |------|--------|------|-------------|
-| Last trade price | RDB | 5011 | `trade_binance` |
-| Raw trade history | RDB | 5011 | `trade_binance` |
-| L5 order book | RTE | 5012 | `.rte.getOrderBook[]` |
-| Rolling VWAP | RTE | 5012 | `.rte.getVwap[]` |
-| Order book imbalance | RTE | 5012 | `.rte.getImbalanceAll[]` |
-| Variance-covariance | RTE | 5012 | `.rte.getCorrelationTable[]` |
-| Analytics validity | RTE | 5012 | `.rte.getVwap[]`, `.rte.getVcov[]` (return `isValid`) |
-| FH latency metrics | TEL | 5013 | `telemetry_latency_fh` |
-| E2E latency metrics | TEL | 5013 | `telemetry_latency_e2e` |
-| FH health status | TEL | 5013 | `.tel.vsFhStatus[]` |
-| System memory | TEL | 5013 | `.tel.vsSystemResources[]` |
-| Throughput | TEL | 5013 | Derived from `telemetry_latency_fh.cnt / 5` |
+| Last trade price | WDB | 5012 | `trade_binance` |
+| Raw trade history | WDB | 5012 | `trade_binance` |
+| L5 order book | RTE | 5013 | `.rte.getOrderBook[]` |
+| Rolling VWAP | RTE | 5013 | `.rte.getVwap[]` |
+| Order book imbalance | RTE | 5013 | `.rte.getImbalanceAll[]` |
+| Variance-covariance | RTE | 5013 | `.rte.getCorrelationTable[]` |
+| Analytics validity | RTE | 5013 | `.rte.getVwap[]`, `.rte.getVcov[]` (return `isValid`) |
+| DIB bars | MLE | 5015 | `.mle.getDIB[]` |
+| DRB bars | MLE | 5015 | `.mle.getDRB[]` |
+| ML label stats | MLE | 5015 | `.mle.labelStats[]` |
+| FH latency metrics | TEL | 5014 | `telemetry_latency_fh` |
+| E2E latency metrics | TEL | 5014 | `telemetry_latency_e2e` |
+| FH health status | TEL | 5014 | `.tel.vsFhStatus[]` |
+| System memory | TEL | 5014 | `.tel.vsSystemResources[]` |
+| Throughput | TEL | 5014 | Derived from `telemetry_latency_fh.cnt / 5` |
 
 **Trade-off acknowledged:** The reference architecture recommends:
 > "Processes accessed by users should be isolated from those performing core system calculations to improve stability and resource control."
@@ -120,16 +127,16 @@ For this exploratory project with a single user, direct querying is acceptable. 
 
 ### Dashboard Specification
 
-Three dashboards are defined:
+Four dashboards are defined:
 
 **Dashboard 1: Market Overview**
 
 | Panel | Data Source | Content | Update |
 |-------|-------------|---------|--------|
-| Last Price | RDB | Most recent trade price per symbol | 1 sec |
+| Last Price | WDB | Most recent trade price per symbol | 1 sec |
 | Rolling Avg Price | RTE | `avgPrice` from `.rte.getVwap[]` | 1 sec |
 | Trade Count | RTE | `tradeCount` from `.rte.getVwap[]` | 1 sec |
-| Price Chart | RDB | Time series of recent prices (last 5 min) | 1 sec |
+| Price Chart | WDB | Time series of recent prices (last 5 min) | 1 sec |
 | VWAP Validity | RTE | `isValid` from `.rte.getVwap[]` | 1 sec |
 | Order Book | RTE | `.rte.getOrderBook[]` | 1 sec |
 | OBI Indicator | RTE | `.rte.getImbalanceAll[]` | 1 sec |
@@ -152,8 +159,18 @@ Three dashboards are defined:
 | System Memory | TEL | `.tel.vsSystemResources[]` | 1 sec |
 | Data Volume | TEL | `.tel.vsDataVolume[]` | 1 sec |
 | Analytics Validity | RTE | `isValid` from `.rte.getVwap[]`, `.rte.getVcov[]` | 1 sec |
-| Data Freshness | RDB | Time since last trade per symbol | 1 sec |
-| Gap Indicator | RDB | Detected `fhSeqNo` gaps (if any) | 1 sec |
+| Data Freshness | WDB | Time since last trade per symbol | 1 sec |
+| Gap Indicator | WDB | Detected `fhSeqNo` gaps (if any) | 1 sec |
+
+**Dashboard 4: ML Features**
+
+| Panel | Data Source | Content | Update |
+|-------|-------------|---------|--------|
+| DIB Bar Summary | MLE | `.mle.barStats[]` | 1 sec |
+| DRB Bar Summary | MLE | `.mle.getDRB[]` count per symbol | 1 sec |
+| Recent DIB Bars | MLE | `.mle.getDIB[]` last 10 | 1 sec |
+| Label Distribution | MLE | `.mle.labelStats[]` | 1 sec |
+| Adaptive Thresholds | MLE | `.mle.thresholds[]` | 1 sec |
 
 ### Validity Display
 
@@ -174,7 +191,7 @@ Additionally:
 
 | Metric | Source | Target Latency (data age) |
 |--------|--------|---------------------------|
-| Last price | RDB | < 2 seconds |
+| Last price | WDB | < 2 seconds |
 | Rolling avg | RTE | < 2 seconds |
 | Telemetry | TEL | < 7 seconds (5s bucket + 2s query) |
 
@@ -198,14 +215,14 @@ The reference architecture describes a UI caching pattern for scale:
 
 For this project:
 - Single user (developer) assumed
-- Direct RDB/RTE/TEL queries acceptable
+- Direct WDB/RTE/MLE/TEL queries acceptable
 - No UI cache implemented
 - No gateway process implemented
 
 If multiple users or higher query rates are needed:
 - Introduce UI cache process
 - Cache pre-computes common queries
-- Dashboards query cache instead of RDB/RTE/TEL
+- Dashboards query cache instead of WDB/RTE/MLE/TEL
 
 ### Intended Usage
 
@@ -214,6 +231,7 @@ Dashboards are intended for:
 - Real-time behaviour inspection
 - Latency and performance reasoning
 - Architecture exploration
+- ML feature monitoring
 
 They are **not** intended as:
 - End-user trading interfaces
@@ -287,7 +305,7 @@ Rejected:
 Rejected:
 - Sluggish feel during development
 - Delays in observing system behaviour
-- 1-second provides better responsiveness for RDB/RTE data
+- 1-second provides better responsiveness for WDB/RTE data
 
 ### 8. Separate throughput table in TEL
 Rejected:
@@ -306,7 +324,7 @@ Rejected:
 ### Positive
 
 - Rapid feedback during development
-- Clear visibility into raw data (RDB), analytics (RTE), and telemetry (TEL)
+- Clear visibility into raw data (WDB), analytics (RTE), ML features (MLE), and telemetry (TEL)
 - Tight integration with kdb ecosystem
 - Minimal infrastructure requirements
 - Validity indicators aid interpretation
@@ -321,7 +339,7 @@ Rejected:
 - Direct queries mix user and system load
 - No alerting capability (human must observe)
 - Telemetry has 5-second delay due to bucket size
-- Dashboard must query both TEL and RTE for complete health picture
+- Dashboard must query TEL and RTE for complete health picture
 
 These trade-offs are acceptable for the current phase.
 
@@ -345,3 +363,4 @@ These trade-offs are acceptable for the current phase.
 - `adr-004-real-time-rolling-analytics-computation.md` (RTE analytics, validity flags)
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` (TEL tables, bucket alignment)
 - `adr-006-recovery-and-replay-strategy.md` (gap detection display)
+- `adr-011-financial-machine-learning.md` (MLE bar queries)

@@ -1,14 +1,14 @@
 # ADR-001: Timestamps and Latency Measurement
 
 ## Status
-Accepted (Updated 2026-01-06)
+Accepted (Updated 2026-01-16)
 
 ## Date
 Original: 2025-12-17
-Updated: 2026-01-06
+Updated: 2026-01-16
 
 ## Context
-This project ingests real-time Binance market data via WebSocket (JSON), normalises it in high-performance C++ feed handlers (Boost.Beast + RapidJSON), and publishes it into a kdb+/KDB-X environment (tickerplant/RDB) via IPC (kdb+ C API).
+This project ingests real-time Binance market data via WebSocket (JSON), normalises it in high-performance C++ feed handlers (Boost.Beast + RapidJSON), and publishes it into a KDB-X environment (tickerplant/WDB) via IPC (kdb+ C API).
 
 **Feed Handlers:**
 - **Trade Feed Handler**: Ingests individual trade executions (simple 1:1 message flow)
@@ -17,7 +17,7 @@ This project ingests real-time Binance market data via WebSocket (JSON), normali
 We need consistent timestamping to:
 - Measure latency within feed handlers reliably (parsing, normalisation, IPC send).
 - Estimate end-to-end latency through the kdb pipeline.
-- Correlate events across components (FH, TP, RDB, downstream).
+- Correlate events across components (FH, TP, WDB, downstream).
 - Support debugging during reconnect/recovery scenarios.
 
 Binance events include upstream timestamps:
@@ -31,14 +31,17 @@ For trade events, `T` and `E` may be equal but are treated as distinct fields. Q
 | Acronym | Definition |
 |---------|------------|
 | FH | Feed Handler |
+| HDB | Historical Database |
 | IPC | Inter-Process Communication |
+| MLE | Machine Learning Engine |
 | NTP | Network Time Protocol |
 | PTP | Precision Time Protocol (IEEE 1588) |
-| RDB | Real-Time Database |
 | RTE | Real-Time Engine |
 | SLO | Service-Level Objective |
+| TEL | Telemetry |
 | TP | Tickerplant |
 | UTC | Coordinated Universal Time |
+| WDB | Write-only Database (intraday writedown to HDB) |
 
 ## Decision
 
@@ -133,7 +136,7 @@ For each L2 quote snapshot published, the feed handler captures:
 | Field | Description | Unit |
 |-------|-------------|------|
 | `tpRecvTimeUtcNs` | TP receive time captured at ingest (`.z.p` converted to nanoseconds since epoch) | nanoseconds since epoch |
-| `rdbApplyTimeUtcNs` | Time the update becomes query-consistent in the RDB (nanoseconds since epoch) | nanoseconds since epoch |
+| `wdbRecvTimeUtcNs` | Time the update is received in the WDB (nanoseconds since epoch) | nanoseconds since epoch |
 
 **Notes:**
 - Monotonic instants are not stored as absolute values; only derived durations are recorded.
@@ -153,7 +156,7 @@ For this exploratory project, all timestamp and latency fields are stored **per-
 - `tradeId`
 - Normalised business fields (sym, price, qty, buyerIsMaker, etc.)
 - `tpRecvTimeUtcNs`
-- `rdbApplyTimeUtcNs`
+- `wdbRecvTimeUtcNs`
 
 **Quote table (`quote_binance`) stores:**
 - `exchEventTimeMs` (from depth update)
@@ -164,7 +167,7 @@ For this exploratory project, all timestamp and latency fields are stored **per-
 - L2 order book snapshot (bidPrice1-5, bidQty1-5, askPrice1-5, askQty1-5)
 - `isValid` (order book synchronization status flag)
 - `tpRecvTimeUtcNs`
-- `rdbApplyTimeUtcNs`
+- `wdbRecvTimeUtcNs`
 
 **Telemetry tables store aggregated metrics (per handler type):**
 - Time bucket (e.g., 5-second buckets)
@@ -206,8 +209,8 @@ All timestamps use nanoseconds since epoch. Unit conversions are explicit in for
 |--------|------------|---------|-------|
 | `market_to_fh_ms` | Binance to FH receive | `(fhRecvTimeUtcNs / 1e6) - exchEventTimeMs` | Indicative only; includes network + exchange semantics; may be negative if clocks are misaligned |
 | `fh_to_tp_ms` | FH send to TP receive | `(tpRecvTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | Same-unit subtraction, then convert to ms |
-| `tp_to_rdb_ms` | TP receive to RDB apply | `(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) / 1e6` | |
-| `e2e_system_ms` | FH receive to RDB apply | `(rdbApplyTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | Full system latency |
+| `tp_to_wdb_ms` | TP receive to WDB receive | `(wdbRecvTimeUtcNs - tpRecvTimeUtcNs) / 1e6` | |
+| `e2e_system_ms` | FH receive to WDB receive | `(wdbRecvTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | Full system latency |
 
 **Handler-specific considerations:**
 - Trade handler: 1 message in → 1 event out (simple flow)
@@ -240,7 +243,7 @@ SLOs should explicitly state:
 - Whether invalid order book states (quote_fh) are included or excluded
 
 **Example SLO statement:**
-> "Trade feed handler (trade_fh) p95 end-to-end latency (FH receive to RDB apply) shall be < 10ms for BTCUSDT, measured over 1-minute windows, excluding reconnection bursts."
+> "Trade feed handler (trade_fh) p95 end-to-end latency (FH receive to WDB receive) shall be < 10ms for BTCUSDT, measured over 1-minute windows, excluding reconnection bursts."
 
 ### 6) Clock Synchronisation Trust Model
 
@@ -267,15 +270,14 @@ KDB-X garbage collection behavior affects latency volatility. All data-path proc
 system "g 0"   / Deferred GC - memory recycled internally
 ```
 
-| Process | GC Mode | Rationale |
-|---------|---------|-----------|
-| TP | Deferred | High message throughput |
-| RDB | Deferred | Frequent inserts |
-| RTE | Deferred | Hot path updates + timer cleanup |
-| TEL | Deferred | Periodic queries and aggregation |
-| MLE | Deferred | Hot path accumulator updates |
-| CTL | Default | Low-frequency administrative |
-| LOG | Default | Low-frequency administrative |
+| Process | Port | GC Mode | Rationale |
+|---------|------|---------|-----------|
+| TP | 5010 | Deferred | High message throughput |
+| WDB | 5012 | Deferred | Frequent inserts, intraday writedown |
+| RTE | 5013 | Deferred | Hot path updates + timer cleanup |
+| TEL | 5014 | Deferred | Periodic queries and aggregation |
+| MLE | 5015 | Deferred | Hot path accumulator updates |
+| LOG | - | On-demand | Run manually for cleanup tasks |
 
 **Deferred GC (`-g 0`):**
 - Memory recycled internally, not returned to OS
@@ -344,7 +346,7 @@ Reference: *Building Real-Time Event-Driven KDB-X Systems* §Performance Tuning:
 ### Negative / Trade-offs
 - End-to-end latency across hosts can be misleading without good clock sync; requires explicit trust rules and monitoring.
 - Per-event latency fields increase storage volume (acceptable for exploratory project).
-- Additional instrumentation effort in both FH and TP/RDB for both handler types.
+- Additional instrumentation effort in both FH and TP/WDB for both handler types.
 - Sequence number adds a small amount of state to each feed handler.
 - Quote handler latency is inherently more variable due to stateful processing; requires careful interpretation.
 - Quote `isValid` flag adds complexity to SLO calculations (exclusion logic).

@@ -1,11 +1,11 @@
 # ADR-010: Log Management and Lifecycle
 
 ## Status
-Accepted (Updated 2026-01-11)
+Accepted (Updated 2026-01-16)
 
 ## Date
 Original: 2026-01-07
-Updated: 2026-01-09, 2026-01-11
+Updated: 2026-01-09, 2026-01-11, 2026-01-16
 
 ## Context
 
@@ -28,14 +28,16 @@ A decision is required on how log files are managed throughout their lifecycle.
 
 | Acronym | Definition |
 |---------|------------|
-| LOG | Log Manager Process |
-| RDB | Real-Time Database |
+| HDB | Historical Database |
+| MLE | Machine Learning Engine |
 | RTE | Real-Time Engine |
+| TEL | Telemetry Process |
 | TP | Tickerplant |
+| WDB | Write-only Database (intraday writedown to HDB) |
 
 ## Decision
 
-A dedicated **LOG manager process** (port 5014) handles log lifecycle management.
+An **on-demand log manager** (`logmgr.q`) handles log lifecycle management.
 
 ### Architecture
 
@@ -50,11 +52,17 @@ A dedicated **LOG manager process** (port 5014) handles log lifecycle management
     +------------------+------------------+------------------+
     |                  |                  |                  |
     v                  v                  v                  v
-RDB :5011         RTE :5012          TEL :5013          LOG :5014
-(replay)          (replay)           (health sub)       (management)
+WDB :5012         RTE :5013          MLE :5015          TEL :5014
+(replay)          (replay)           (replay)           (health sub)
+
+                  +-- logmgr.q (on-demand) --+
+                  |  .log.list[]             |
+                  |  .log.cleanup[days]      |
+                  |  .log.verify[file]       |
+                  +--------------------------+
 ```
 
-### LOG Process Responsibilities
+### Log Manager Responsibilities
 
 | Function | Description |
 |----------|-------------|
@@ -64,13 +72,27 @@ RDB :5011         RTE :5012          TEL :5013          LOG :5014
 | Cleanup | Delete logs older than retention period |
 | Monitoring | Provide log health metrics |
 
-### Process Configuration
+### On-Demand Usage
+
+Log management is run manually when needed:
+
+```bash
+# Start logmgr interactively
+cd ~/new-tick-to-signal/kdb
+q logmgr.q
+
+# Or run specific commands
+q logmgr.q -q <<< ".log.list[]"
+q logmgr.q -q <<< ".log.cleanup[7]"
+```
+
+**No port assignment:** Unlike the running processes (TP, WDB, RTE, MLE, TEL), logmgr does not listen on a port and is not a continuously running service.
+
+### Configuration
 
 ```q
-.log.cfg.port:5014;              / LOG process port
 .log.cfg.logDir:"logs";          / Log directory
 .log.cfg.retentionDays:7;        / Default retention period
-.log.cfg.cleanupHour:0;          / Cleanup hour (midnight)
 ```
 
 ### Query Interface
@@ -145,7 +167,6 @@ Uses `-11!(-2;file)` to get chunk count without full replay.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `retentionDays` | 7 | Keep logs for 7 days |
-| `cleanupHour` | 0 | Run cleanup at midnight (if automated) |
 
 **Cleanup logic:**
 1. Calculate cutoff date: `today - retentionDays`
@@ -153,54 +174,55 @@ Uses `-11!(-2;file)` to get chunk count without full replay.
 3. Delete files with date < cutoff
 4. Log each deletion
 
-### Automated Cleanup (Optional)
+### Scheduled Cleanup (Optional)
 
-Timer-based cleanup can be enabled:
-```q
-/ Enable automatic cleanup at configured hour
-.z.ts:{.log.checkCleanup[]};
-system "t 60000";   / Check every minute
+For automated cleanup, use cron:
+
+```bash
+# Run cleanup daily at midnight
+0 0 * * * cd ~/new-tick-to-signal/kdb && q logmgr.q -q <<< ".log.cleanup[7]" >> logs/cleanup.log 2>&1
 ```
 
-**Default:** Disabled. Cleanup is manual via `.log.cleanup[]`.
+**Default:** Manual cleanup via `.log.cleanup[]`.
 
 ### Integration with Control Process
 
-CTL (port 5000) includes LOG in health checks:
+CTL (port 5000) does **not** include logmgr in health checks since it's on-demand:
+
 ```q
 .ctl.healthCheck[]
 / tp    | 1
-/ rdb   | 1
+/ wdb   | 1
 / rte   | 1
+/ mle   | 1
 / tel   | 1
-/ logmgr| 1
 
 .ctl.statusTable[]
 / process port status started
 / -------------------------------------------------
 / TP      5010 Live   2026.01.07D03:46:37
-/ RDB     5011 Live   2026.01.07D03:46:38
-/ RTE     5012 Live   2026.01.07D03:46:39
-/ TEL     5013 Live   2026.01.07D03:46:40
-/ LOG     5014 Live   2026.01.07D03:46:41
+/ WDB     5012 Live   2026.01.07D03:46:38
+/ RTE     5013 Live   2026.01.07D03:46:39
+/ MLE     5015 Live   2026.01.07D03:46:40
+/ TEL     5014 Live   2026.01.07D03:46:41
 ```
 
 ### Startup Scripts
 
-LOG is included in all startup scripts:
-- `start.sh` - tmux window for LOG
-- `start_bg.sh` - background process with PID file
-- `stop.sh` - graceful shutdown (SIGTERM then SIGKILL)
+Logmgr is **not** included in startup scripts since it's on-demand:
+- `start.sh` - Does not include logmgr
+- `start_bg.sh` - Does not include logmgr
+- `stop.sh` - Does not include logmgr
 
 ## Rationale
 
 This approach was selected because:
 
-**Dedicated process:**
+**On-demand tool:**
 - Separates log management from data processing
-- No impact on TP, RDB, or RTE performance
-- Can run diagnostics without affecting live system
-- Independent restart capability
+- No additional running process to manage
+- Minimal resource usage
+- Can be scheduled via cron if needed
 
 **Query-based interface:**
 - Flexible (any retention period, any date)
@@ -215,44 +237,49 @@ This approach was selected because:
 
 ## Alternatives Considered
 
-### 1. Log management in TP
+### 1. Dedicated running LOG process (previous design)
+Changed (2026-01-16):
+- Added process management overhead
+- No continuous log management needed
+- On-demand is simpler and sufficient
+
+### 2. Log management in TP
 Rejected:
 - TP should focus on sequencing and publishing
 - Adds complexity to critical path
 - Risk of affecting ingest performance
 
-### 2. Log management in RDB
+### 3. Log management in WDB
 Rejected:
-- RDB should focus on storage and queries
-- Log management is not RDB's responsibility
-- Separate process is cleaner
+- WDB should focus on storage and HDB writedown
+- Log management is not WDB's responsibility
+- Separate tool is cleaner
 
-### 3. External tool (bash script)
+### 4. External tool (bash script)
 Rejected:
 - Cannot query log internals (chunk counts)
 - Cannot integrate with q ecosystem
 - Less visibility into log health
 
-### 4. Automatic cleanup only (no manual control)
+### 5. Automatic cleanup only (no manual control)
 Rejected:
 - Less flexible
 - Harder to debug
 - Risk of unexpected deletions
 - Manual control is safer
 
-### 5. Log compression
+### 6. Log compression
 Deferred:
 - Adds complexity
 - Current disk usage acceptable
 - Can be added if storage becomes concern
 
-### 6. Log archival to HDB
+### 7. Log archival to HDB
 Deferred:
-- No HDB implemented yet
 - Out of scope for current phase
-- Can be added when HDB is built
+- Can be added when needed
 
-### 7. Separate log files per table
+### 8. Separate log files per table
 Rejected (2026-01-09):
 - Breaks chronological order during replay
 - Complicates point-in-time recovery
@@ -267,15 +294,15 @@ Rejected (2026-01-09):
 - Controlled disk space usage
 - Easy diagnostics and verification
 - Flexible retention policies
-- Integration with control process
 - No impact on data processing components
 - Safe (manual cleanup by default)
 - Simple file discovery (one file per day)
+- No additional running process
 
 ### Negative / Trade-offs
 
-- Additional process to manage (port 5014)
-- Manual cleanup required (automatic disabled by default)
+- Manual cleanup required (no automatic scheduled cleanup by default)
+- Must remember to run cleanup periodically
 - No log compression (larger disk usage)
 - No archival (logs deleted, not preserved)
 
@@ -295,11 +322,7 @@ These trade-offs are acceptable for the current phase.
 
 | File | Purpose |
 |------|---------|
-| `kdb/logmgr.q` | LOG manager process |
-| `kdb/ctl.q` | Control process (includes LOG) |
-| `start.sh` | tmux startup (includes LOG) |
-| `start_bg.sh` | Background startup (includes LOG) |
-| `stop.sh` | Graceful shutdown (includes LOG) |
+| `kdb/logmgr.q` | Log manager (on-demand) |
 
 ## Links / References
 

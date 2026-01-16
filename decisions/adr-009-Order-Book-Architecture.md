@@ -1,11 +1,11 @@
 # ADR-009: Order Book Architecture
 
 ## Status
-Accepted (Updated 2026-01-14)
+Accepted (Updated 2026-01-16)
 
 ## Date
 Original: 2025-12-29
-Updated: 2026-01-03, 2026-01-06, 2026-01-11, 2026-01-14
+Updated: 2026-01-03, 2026-01-06, 2026-01-11, 2026-01-14, 2026-01-16
 
 ## Context
 
@@ -35,6 +35,8 @@ A decision is required on how to implement order book ingestion with correct rec
 
 **Update (2026-01-14):** Standardized terminology to use "Level 2 (5 levels)"
 
+**Update (2026-01-16):** Updated schema to use `wdbRecvTimeUtcNs` (WDB) instead of `rdbApplyTimeUtcNs` (RDB).
+
 ## Notation
 
 | Acronym | Definition |
@@ -43,6 +45,7 @@ A decision is required on how to implement order book ingestion with correct rec
 | L1 | Level 1 — best bid/ask only (top of book) |
 | L2 | Level 2 — multiple price levels of depth |
 | TP | Tickerplant |
+| WDB | Write-only Database (intraday writedown to HDB) |
 
 **Depth terminology used in this document:**
 - "Level 2 (5 levels)" or "L2 depth" refers to order book data with 5 price levels per side
@@ -213,12 +216,12 @@ Downstream consumers see explicit invalid state and can react appropriately.
 | 27 | `fhSendUs` | long | FH | Snapshot build + send latency (μs) |
 | 28 | `fhSeqNo` | long | FH | FH sequence number |
 | 29 | `tpRecvTimeUtcNs` | long | TP | TP receive time (ns) |
-| 30 | `rdbApplyTimeUtcNs` | long | RDB | RDB apply time (ns) |
+| 30 | `wdbRecvTimeUtcNs` | long | WDB | WDB receive time (ns) |
 
 **Field count progression:**
 - FH sends: 28 fields (was 26 before timing added)
 - TP adds: 1 field (`tpRecvTimeUtcNs`)
-- RDB adds: 1 field (`rdbApplyTimeUtcNs`)
+- WDB adds: 1 field (`wdbRecvTimeUtcNs`)
 - Total: 30 fields (was 28 before timing added)
 
 See `docs/specs/quotes-schema.md` for full schema specification.

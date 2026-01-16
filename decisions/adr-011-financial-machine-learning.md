@@ -1,10 +1,10 @@
 # ADR-011: Financial Machine Learning Engine
 
 ## Status
-Accepted
+Accepted (Updated 2026-01-16)
 
 ## Date
-2026-01-15
+2026-01-15 (Updated 2026-01-16)
 
 ## Context
 
@@ -39,10 +39,11 @@ A decision is required on **where and how these ML features are computed**.
 | EWMA | Exponential Weighted Moving Average |
 | HDB | Historical Database |
 | MLE | Machine Learning Engine |
-| RDB | Real-Time Database |
+| RTE | Real-Time Engine |
 | TIB | Tick Imbalance Bars (not implemented) |
 | TP | Tickerplant |
 | VIB | Volume Imbalance Bars (not implemented) |
+| WDB | Write-only Database (intraday writedown to HDB) |
 
 ## Decision
 
@@ -71,15 +72,15 @@ Dollar-based bars ensure:
 ### Architectural Placement
 
 ```
-TP ──┬──► RDB : 5011 (storage: trade_binance, quote_binance)
-     │
-     ├──► RTE : 5012 (analytics: VWAP, Imbalance, VarCovar)
-     │
-     └──► MLE : 5015 (ML features: DIB, DRB, Labels)
+TP :5010 ──┬──► WDB :5012 (storage: trade_binance, quote_binance → HDB)
+           │
+           ├──► RTE :5013 (analytics: VWAP, Imbalance, VarCovar)
+           │
+           └──► MLE :5015 (ML features: DIB, DRB, Labels)
 ```
 
 - The **MLE** subscribes directly to the tickerplant for live updates
-- The **MLE** is a peer subscriber alongside RDB and RTE
+- The **MLE** is a peer subscriber alongside WDB and RTE
 - The **MLE** maintains its own state for bar computation and labeling
 
 ### Processing Mode
@@ -243,61 +244,61 @@ Entry Price ───────●
          |←── Vertical Barrier (time limit) ──→|
 ```
 
-| Barrier Hit | Label | Meaning |
-|-------------|-------|---------|
-| Upper | +1 | Price went up → profitable long |
-| Lower | -1 | Price went down → profitable short |
-| Vertical | 0 | No clear direction → no trade |
+### Barrier Configuration
 
-### Implementation
-
-**Configuration:**
 ```q
-.mle.cfg.label.upperPct:0.5;       / +0.5% take profit (fixed)
-.mle.cfg.label.lowerPct:0.5;       / -0.5% stop loss (fixed)
-.mle.cfg.label.horizonBars:10;     / Max 10 bars forward
-.mle.cfg.label.horizonMs:300000;   / Or 5 minutes max
-.mle.cfg.label.useVolAdjust:1b;    / Use volatility-adjusted barriers
-.mle.cfg.label.volLookback:20;     / Bars for volatility calculation
-.mle.cfg.label.volMultiplier:2.0;  / Barrier = 2 × rolling volatility
+.mle.cfg.label.profitTarget:0.001;    / 0.1% profit target
+.mle.cfg.label.stopLoss:0.001;        / 0.1% stop loss
+.mle.cfg.label.horizonBars:10;        / 10 bars forward
+.mle.cfg.label.horizonTimeMs:300000;  / 5 minutes max
+.mle.cfg.label.volLookbackBars:20;    / 20 bars for vol estimate
 ```
 
-**Volatility-Adjusted Barriers:**
-Instead of fixed percentages, barriers scale with recent volatility:
+### Volatility-Adjusted Barriers
+
+Fixed barriers don't account for different volatility regimes. We adjust barriers based on recent volatility:
+
 ```q
-volatility = stddev(log returns of last 20 bars)
-upperPrice = entryPrice × (1 + volMultiplier × volatility)
-lowerPrice = entryPrice × (1 - volMultiplier × volatility)
+/ Calculate recent volatility from bar returns
+vol = sqrt(var(log(close[t] / close[t-1])))
+
+/ Adjust barriers by volatility
+upperBarrier = entry × (1 + profitTarget × vol/baseVol)
+lowerBarrier = entry × (1 - stopLoss × vol/baseVol)
 ```
 
-**Data Structure:**
+### Label Values
+
+| Label | Meaning | Barrier Hit |
+|-------|---------|-------------|
+| +1 | Long profitable | Upper barrier hit first |
+| -1 | Short profitable | Lower barrier hit first |
+| 0 | No move | Neither barrier hit within horizon |
+
+### Data Structure
+
 ```q
 labeled_bars:([]
-    time:`timestamp$();           / Entry time
+    time:`timestamp$();           / Bar time
     sym:`symbol$();
-    close:`float$();              / Entry price
-    dollarVolume:`float$();       / Bar features...
-    ticks:`long$();
-    theta:`float$();
-    buyDollarPct:`float$();
-    duration:`long$();
-    / Label columns
-    label:`short$();              / -1, 0, +1
-    ret:`float$();                / Actual return at exit
-    exitTime:`timestamp$();
-    exitPrice:`float$();
-    barrierHit:`symbol$();        / `upper`lower`vertical
-    upperBarrier:`float$();
-    lowerBarrier:`float$();
-    volatility:`float$()
+    entryPrice:`float$();         / Price at bar close
+    label:`short$();              / +1, -1, or 0
+    exitPrice:`float$();          / Price when barrier hit
+    exitTime:`timestamp$();       / Time when barrier hit
+    barsToExit:`long$();          / Bars until exit
+    returnPct:`float$();          / Actual return achieved
+    volAtEntry:`float$();         / Volatility at entry
+    upperBarrier:`float$();       / Upper barrier price
+    lowerBarrier:`float$()        / Lower barrier price
 );
 ```
 
-**Labeling Algorithm:**
-1. For each DIB bar older than horizon time
-2. Look forward through subsequent DIB bars
-3. Check if high >= upperBarrier (upper hit)
-4. Check if low <= lowerBarrier (lower hit)
+### Labeling Algorithm
+
+1. For each unlabeled DIB bar older than horizon
+2. Get subsequent bars up to horizon
+3. Calculate vol-adjusted barriers
+4. Scan forward for barrier breach
 5. If neither within horizon → vertical hit
 6. Assign label based on which barrier hit first
 
@@ -379,12 +380,11 @@ On MLE restart:
 
 | Step | Action |
 |------|--------|
-| 1 | Connect and subscribe to tickerplant |
-| 2 | Begin accumulating new bars |
-| 3 | Adaptive thresholds retained (learned values persist EOD) |
-| 4 | Labels become valid after horizon time (5 min) |
-
-**Note:** Unlike RTE, MLE does not replay TP logs. Bars are regenerated from live data. For historical analysis, bars should be computed from HDB tick data.
+| 1 | Replay today's TP log file (if exists) |
+| 2 | Run cleanup to remove stale bars |
+| 3 | Subscribe to tickerplant for live updates |
+| 4 | Begin accumulating new bars |
+| 5 | Adaptive thresholds restored from replay |
 
 **Warm-up Times:**
 - DIB/DRB Bars: Immediate (first threshold breach)
@@ -512,7 +512,7 @@ Rejected:
 
 - Labels require warm-up (horizon time + vol lookback)
 - Adaptive thresholds need ~10 bars to stabilize
-- No replay from TP logs (bars regenerated live)
+- Replay from TP logs required for state recovery
 - Volatility lookback requires sufficient bar history
 
 ---
