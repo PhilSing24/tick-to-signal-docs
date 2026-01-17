@@ -1,11 +1,11 @@
 # ADR-009: Order Book Architecture
 
 ## Status
-Accepted (Updated 2026-01-16)
+Accepted (Updated 2026-01-17)
 
 ## Date
 Original: 2025-12-29
-Updated: 2026-01-03, 2026-01-06, 2026-01-11, 2026-01-14, 2026-01-16
+Updated: 2026-01-03, 2026-01-06, 2026-01-11, 2026-01-14, 2026-01-16, 2026-01-17
 
 ## Context
 

@@ -53,7 +53,16 @@ No strict uniqueness key (quotes are snapshots, not unique events).
 
 For ordering/correlation: `(sym, time, fhSeqNo)`
 
-### Schema (30 Fields)
+### Schema by Process
+
+The schema varies slightly by process, as each adds its own receive timestamp:
+
+| Process | Fields | Added Field |
+|---------|--------|-------------|
+| FH sends | 28 | — |
+| TP adds | 29 | `tpRecvTimeUtcNs` |
+| WDB adds | 30 | `wdbRecvTimeUtcNs` |
+| RDB adds | 30 | `rdbRecvTimeUtcNs` |
 
 | # | Column | Type | Source | Description |
 |---|--------|------|--------|-------------|
@@ -86,9 +95,12 @@ For ordering/correlation: `(sym, time, fhSeqNo)`
 | 27 | `fhSendUs` | long | FH | L5 build + IPC send duration (µs, monotonic) |
 | 28 | `fhSeqNo` | long | FH | FH sequence number (monotonic per FH instance) |
 | 29 | `tpRecvTimeUtcNs` | long | TP | TP receive time (ns since Unix epoch) |
-| 30 | `rdbApplyTimeUtcNs` | long | RDB | RDB apply time (ns since Unix epoch) |
+| 30 | `wdbRecvTimeUtcNs` | long | WDB | WDB receive time — **WDB only** |
+| 30 | `rdbRecvTimeUtcNs` | long | RDB | RDB receive time — **RDB only** |
 
-### q Schema Definition
+**Note:** Field 30 is either `wdbRecvTimeUtcNs` (in WDB) or `rdbRecvTimeUtcNs` (in RDB), not both.
+
+### q Schema Definition (WDB)
 
 ```q
 quote_binance:([]
@@ -126,7 +138,49 @@ quote_binance:([]
   fhSendUs:`long$();
   fhSeqNo:`long$();
   tpRecvTimeUtcNs:`long$();
-  rdbApplyTimeUtcNs:`long$()
+  wdbRecvTimeUtcNs:`long$()
+  )
+```
+
+### q Schema Definition (RDB)
+
+```q
+quote_binance:([]
+  time:`timestamp$();
+  sym:`symbol$();
+  / L5 bid prices (best to worst)
+  bidPrice1:`float$();
+  bidPrice2:`float$();
+  bidPrice3:`float$();
+  bidPrice4:`float$();
+  bidPrice5:`float$();
+  / L5 bid quantities
+  bidQty1:`float$();
+  bidQty2:`float$();
+  bidQty3:`float$();
+  bidQty4:`float$();
+  bidQty5:`float$();
+  / L5 ask prices (best to worst)
+  askPrice1:`float$();
+  askPrice2:`float$();
+  askPrice3:`float$();
+  askPrice4:`float$();
+  askPrice5:`float$();
+  / L5 ask quantities
+  askQty1:`float$();
+  askQty2:`float$();
+  askQty3:`float$();
+  askQty4:`float$();
+  askQty5:`float$();
+  / Metadata and instrumentation
+  isValid:`boolean$();
+  exchEventTimeMs:`long$();
+  fhRecvTimeUtcNs:`long$();
+  fhParseUs:`long$();
+  fhSendUs:`long$();
+  fhSeqNo:`long$();
+  tpRecvTimeUtcNs:`long$();
+  rdbRecvTimeUtcNs:`long$()
   )
 ```
 
@@ -175,7 +229,8 @@ The feed handler sets `isValid = 0b` when:
 | `fhSendUs` | Monotonic | FH segment latency (L5 build + IPC send) |
 | `fhSeqNo` | N/A | Gap detection, ordering |
 | `tpRecvTimeUtcNs` | Wall-clock | FH→TP latency calculation |
-| `rdbApplyTimeUtcNs` | Wall-clock | TP→RDB latency, E2E latency |
+| `wdbRecvTimeUtcNs` | Wall-clock | TP→WDB latency (WDB only) |
+| `rdbRecvTimeUtcNs` | Wall-clock | CTP→RDB latency (RDB only) |
 
 ## Timestamp Semantics
 
@@ -208,6 +263,12 @@ The feed handler sets `isValid = 0b` when:
 
 ### Pipeline Times
 
+| Field | Description |
+|-------|-------------|
+| `tpRecvTimeUtcNs` | Added by TP on receipt |
+| `wdbRecvTimeUtcNs` | Added by WDB (tick-by-tick from TP) |
+| `rdbRecvTimeUtcNs` | Added by RDB (batched from CTP) |
+
 Same semantics as trade schema (see `trades-schema.md`).
 
 ## Latency Calculations
@@ -217,8 +278,8 @@ Same semantics as trade schema (see `trades-schema.md`).
 | FH parse latency | `fhParseUs` | Always |
 | FH send latency | `fhSendUs` | Always |
 | FH → TP | `(tpRecvTimeUtcNs - fhRecvTimeUtcNs) / 1e6` ms | Clock sync dependent |
-| TP → RDB | `(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) / 1e6` ms | Clock sync dependent |
-| End-to-end | `(rdbApplyTimeUtcNs - fhRecvTimeUtcNs) / 1e6` ms | Clock sync dependent |
+| TP → WDB | `(wdbRecvTimeUtcNs - tpRecvTimeUtcNs) / 1e6` ms | Clock sync dependent |
+| CTP → RDB | `(rdbRecvTimeUtcNs - tpRecvTimeUtcNs) / 1e6` ms | Clock sync dependent |
 | Market → FH | `(fhRecvTimeUtcNs / 1e6) - exchEventTimeMs` ms | Indicative only |
 
 ## Derived Analytics
@@ -304,6 +365,7 @@ See `cpp/include/order_book_manager.hpp` for implementation.
 | 1.0 | 2025-12-29 | Initial L1 schema (11 fields) |
 | 2.0 | 2026-01-03 | Extended to L5 schema (28 fields) |
 | 2.1 | 2026-01-06 | Added `fhParseUs`, `fhSendUs` (30 fields) |
+| 2.2 | 2026-01-18 | Clarified WDB vs RDB receive timestamps |
 
 ## References
 
@@ -311,6 +373,6 @@ See `cpp/include/order_book_manager.hpp` for implementation.
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` — FH→TP data flow
 - `adr-004-real-time-rolling-analytics-computation.md` — RTE imbalance calculation
 - `adr-005-telemetry-and-metrics-aggregation-strategy.md` — Telemetry aggregation
-- `adr-009-l5-order-book-architecture.md` — Quote handler architecture
+- `adr-009-order-book-architecture.md` — Quote handler architecture
 - `trades-schema.md` — Trade table schema (comparison)
 - `cpp/include/order_book_manager.hpp` — OrderBookManager implementation

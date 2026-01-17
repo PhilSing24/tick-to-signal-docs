@@ -1,39 +1,41 @@
 # ADR-005: Telemetry and Metrics Aggregation Strategy
 
 ## Status
-Accepted (Updated 2026-01-16)
+Accepted (Updated 2026-01-18)
 
 ## Date
 Original: 2025-12-17
-Updated: 2026-01-05, 2026-01-06, 2026-01-07, 2026-01-14, 2026-01-16
+Updated: 2026-01-05, 2026-01-06, 2026-01-07, 2026-01-14, 2026-01-16, 2026-01-17, 2026-01-18
 
 ## Context
 
-The system ingests real-time market data from Binance via two C++ feed handlers and publishes them into a kdb+/KDB-X pipeline (Tickerplant -> WDB -> HDB, RTE, MLE):
+The system ingests real-time market data from Binance via two C++ feed handlers and publishes them into a kdb+/KDB-X pipeline:
 - **Trade Feed Handler**: Processes individual trade executions
 - **Quote Feed Handler**: Maintains L5 order book snapshots from depth updates
 
 To understand system behaviour, diagnose issues, and validate latency targets, we need:
-- Visibility into latency at each pipeline stage (per handler type)
-- Throughput metrics to understand load
+- Visibility into feed handler latency (per handler type)
 - Health indicators to detect problems (per handler)
-- Aggregated views suitable for dashboards and alerting
-- Ability to compare trade vs quote handler performance
+- Aggregated views suitable for dashboards
 
 ADR-001 defines raw timestamp fields captured per event:
 - `fhParseUs`, `fhSendUs` - feed handler segment latencies (both handlers)
-- `fhRecvTimeUtcNs`, `tpRecvTimeUtcNs`, `wdbRecvTimeUtcNs` - wall-clock timestamps for cross-process correlation
+- `fhRecvTimeUtcNs` - wall-clock timestamp for correlation
 
 A decision is required on **how these raw measurements are aggregated, stored, and consumed**, with support for multiple handler types.
+
+**Note:** TEL focuses on **feed handler latency only**. E2E pipeline latency has been removed as it's not critical for the current use case.
 
 ## Notation
 
 | Acronym | Definition |
 |---------|------------|
+| CTP | Chained Tickerplant (batched publisher) |
 | FH | Feed Handler |
 | HDB | Historical Database |
 | IPC | Inter-Process Communication |
 | MLE | Machine Learning Engine |
+| RDB | Real-time Database (query-only) |
 | RTE | Real-Time Engine |
 | SLO | Service-Level Objective |
 | TEL | Telemetry Process |
@@ -42,108 +44,60 @@ A decision is required on **how these raw measurements are aggregated, stored, a
 
 ## Decision
 
-Telemetry will be collected as **raw per-event measurements** and **aggregated in a dedicated TEL process** that queries WDB and RTE using **persistent IPC handles**, and subscribes to health updates via TP.
-
-### Persistent IPC Handles (Added 2026-01-07)
-
-TEL queries WDB and RTE every 5 seconds for telemetry data. To minimize overhead, TEL maintains **persistent IPC connections** rather than opening/closing connections each query cycle.
-
-**Handle Management:**
-```q
-/ Handle dictionary: port -> handle
-.tel.h:(`int$())!`int$();
-
-/ Check if handle exists and is valid
-.tel.hasValidH:{[p]
-  (p in key .tel.h) and not null .tel.h[p]
-  };
-
-/ Get or create handle (lazy connection)
-.tel.getH:{[p]
-  if[not .tel.hasValidH[p];
-    h:@[hopen; `$"::",string p; 0N];
-    if[not null h; .tel.h[p]:h; -1 "TEL: Connected to port ",string p];
-  ];
-  .tel.h[p]
-  };
-
-/ Safe query with automatic reconnect on error
-.tel.safeQuery:{[port;query]
-  h:.tel.getH[port];
-  if[null h; :.tel.queryError];
-  r:@[h; query; {.tel.h[x]_:.tel.h[x]; .tel.queryError}[port]];
-  r
-  };
-```
-
-**Benefits:**
-- Eliminates TCP handshake overhead (4 handshakes/tick → 0)
-- Reduces latency ~4-12ms per 5-second tick
-- Reduces file descriptor churn
-- Automatic reconnection on connection loss
-
-**Connection Lifecycle:**
-- Pre-warm connections at TEL startup
-- Lazy reconnection on query failure
-- Graceful close on TEL shutdown (`.z.exit`)
-- Diagnostic function: `.tel.handleStatus[]`
+Telemetry will be collected from **per-event measurements** received via subscription to Chained TP and **aggregated in a dedicated TEL process**.
 
 ### Telemetry Categories
 
 | Category | Metrics | Source |
 |----------|---------|--------|
-| FH segment latencies | `fhParseUs`, `fhSendUs` per handler | Per-event fields from FH (via WDB query) |
-| Pipeline latencies | `fh_to_tp_ms`, `tp_to_wdb_ms`, `e2e_system_ms` | Derived from wall-clock timestamps (via WDB query, trades and quotes) |
-| Throughput | Events per second, per symbol, per handler | Derived from `cnt` field in latency tables |
-| FH health | `uptimeSec`, `msgsReceived`, `connState` per handler | Published by FH → TP → TEL (subscription) |
-| System metrics | Memory usage per process | Queried from WDB, RTE, captured from TEL |
-
-### Aggregation Location
-
-**Raw per-event latencies are sent by the FH; aggregation happens in a dedicated TEL process.**
-
-| Component | Responsibility |
-|-----------|----------------|
-| Trade FH | Captures `fhParseUs`, `fhSendUs` per trade; publishes trades and health to TP |
-| Quote FH | Captures `fhParseUs`, `fhSendUs` per L5 snapshot; publishes quotes and health to TP |
-| TP | Distributes trades/quotes to WDB, health to TEL; adds `tpRecvTimeUtcNs` |
-| WDB | Stores raw trade/quote events with `wdbRecvTimeUtcNs`; serves queries; writes to HDB |
-| RTE | Computes VWAP/imbalance from market data; serves memory queries |
-| MLE | Computes information-driven bars (DIB/DRB) from trades |
-| TEL | Subscribes to health via TP; queries WDB and RTE on timer (persistent handles); computes aggregated telemetry |
-| Dashboard | Queries TEL for all monitoring data |
-
-Rationale:
-- WDB remains focused on market data storage and HDB writedown (single responsibility)
-- RTE remains focused on analytics (single responsibility)
-- MLE remains focused on ML feature engineering (single responsibility)
-- TEL is the single source of truth for all monitoring/telemetry
-- Health data flows through TP (consistent pub/sub pattern)
-- TEL can query multiple sources (WDB + RTE) for comprehensive metrics
-- **Persistent handles minimize query overhead**
-- Telemetry logic can evolve without affecting storage or analytics
-- Raw per-event latencies remain available in WDB for debugging
-- Dashboards query only TEL for system monitoring (single endpoint)
-- Handler-specific metrics enable performance comparison
+| FH segment latencies | `fhParseUs`, `fhSendUs` per handler | Per-event fields from market data |
+| FH health | `uptimeSec`, `msgsReceived`, `connState` per handler | Published by FH → TP → CTP → TEL |
 
 ### Collection Architecture
 
 ```
-Trade FH ---> TP :5010 --+--> WDB :5012 (trade_binance, quote_binance → HDB)
-Quote FH -------^        |
-                         +--> RTE :5013 (tradeBuckets, .rte.imb.latest)
-                         |
-                         +--> MLE :5015 (dib_bars, drb_bars)
-                         |
-                         +--> TEL :5014 (health_feed_handler subscription)
-                                  |
-                                  +-- queries WDB via persistent handle
-                                  +-- queries RTE via persistent handle
-                                  |
-                                  +-- telemetry_latency_fh (unified: trade + quote)
-                                  +-- telemetry_latency_e2e (trades and quotes)
-                                  +-- telemetry_system (WDB, RTE, TEL memory)
-                                  +-- health_feed_handler (from TP subscription)
+Trade FH ───► TP:5010 ───► CTP:5014 ───┬───► RTE:5015
+Quote FH ──────────────^               ├───► TEL:5016
+                                       └───► RDB:5017
+```
+
+TEL subscribes to Chained TP for:
+- `trade_binance` (extracts `fhParseUs`, `fhSendUs`)
+- `quote_binance` (extracts `fhParseUs`, `fhSendUs`)
+- `health_feed_handler` (FH health metrics)
+
+### Schema Validation
+
+TEL validates incoming message schemas on first receipt to detect schema drift:
+
+**Named field indices (not hardcoded):**
+```q
+/ Trade schema indices
+.tel.idx.trade.sym:1;
+.tel.idx.trade.fhParseUs:9;
+.tel.idx.trade.fhSendUs:10;
+.tel.idx.trade.expectedFields:13;
+
+/ Quote schema indices
+.tel.idx.quote.sym:1;
+.tel.idx.quote.fhParseUs:25;
+.tel.idx.quote.fhSendUs:26;
+.tel.idx.quote.expectedFields:29;
+```
+
+**Validation on first message:**
+- Checks field count matches expected
+- Logs warning if mismatch detected
+- Tracks validation state per table
+
+**Query interface:**
+```q
+.tel.schemaStatus[]
+/ Returns:
+/ table         validated valid expectedFields
+/ --------------------------------------------
+/ trade_binance 1         1     13
+/ quote_binance 1         1     29
 ```
 
 ### Aggregation Strategy
@@ -152,7 +106,7 @@ Quote FH -------^        |
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Bucket size | 5 seconds | Stable percentiles with sufficient samples (~50-500 events) |
+| Bucket size | 5 seconds | Balances granularity with overhead |
 | Computation frequency | Every 5 seconds (timer) | Matches bucket size |
 
 **Percentiles (per bucket):**
@@ -180,37 +134,7 @@ Quote FH -------^        |
 | `sendUs_max` | long | Maximum send latency |
 | `cnt` | long | Number of events in bucket |
 
-**End-to-end latency aggregates (`telemetry_latency_e2e`):**
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `bucket` | timestamp | Start of 5-second bucket |
-| `sym` | symbol | Instrument symbol |
-| `handler` | symbol | Handler type (`trade_fh` or `quote_fh`) |
-| `fhToTpMs_p50` | float | Median FH to TP latency (ms) |
-| `fhToTpMs_p95` | float | 95th percentile FH to TP latency |
-| `fhToTpMs_max` | float | Maximum FH to TP latency |
-| `tpToWdbMs_p50` | float | Median TP to WDB latency (ms) |
-| `tpToWdbMs_p95` | float | 95th percentile TP to WDB latency |
-| `tpToWdbMs_max` | float | Maximum TP to WDB latency |
-| `e2eMs_p50` | float | Median end-to-end latency (FH to WDB) |
-| `e2eMs_p95` | float | 95th percentile E2E latency |
-| `e2eMs_max` | float | Maximum E2E latency |
-| `cnt` | long | Number of events in bucket |
-
-**System metrics (`telemetry_system`):**
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `bucket` | timestamp | Start of 5-second bucket |
-| `component` | symbol | Process name (`WDB`, `RTE`, `TEL`) |
-| `heapMB` | float | Heap size (megabytes) |
-| `usedMB` | float | Memory used (megabytes) |
-| `peakMB` | float | Peak memory (megabytes) |
-
-### Feed Handler Health (via TP Subscription)
-
-**Health table (`health_feed_handler`):**
+**Feed handler health (`health_feed_handler`):**
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -225,8 +149,6 @@ Quote FH -------^        |
 | `connState` | symbol | Connection state (`connected`, `reconnecting`, `disconnected`) |
 | `symbolCount` | int | Number of subscribed symbols |
 
-**Publication frequency:** Every 5 seconds per handler
-
 ### Retention Policy
 
 **Telemetry is ephemeral**, consistent with ADR-003 system-wide stance:
@@ -235,36 +157,50 @@ Quote FH -------^        |
 |--------|--------|
 | Persistence | In-memory only |
 | On restart | Telemetry tables start empty |
-| Historical analysis | Out of scope for current phase |
 | Telemetry bucket retention | Keep last 15 minutes |
 | Health record retention | Keep last 1 minute per handler |
 
-### Connection Diagnostics
+### Connection Resilience
 
-TEL provides handle status for debugging:
+TEL uses resilient connection handling to CTP (see ADR-008):
+- Exponential backoff on connection failure
+- Timer-based reconnection attempts
+- `.z.pc` handler detects disconnection
+- Process continues in degraded mode if CTP unavailable
+
+### Query Interface
+
+**FH Latency:**
 ```q
-.tel.handleStatus[]
-/ Returns:
-/ port  handle status
-/ ---------------------
-/ 5012  8      connected
-/ 5013  9      connected
+.tel.getFhLatency[]     / Latest FH latency stats per handler/sym
+.tel.vsFhLatency[]      / Dashboard-formatted latency grid
 ```
 
-### Dashboard View Functions
+**FH Health:**
+```q
+.tel.fhStatus[]         / Raw health stats per handler
+.tel.vsFhStatus[]       / Dashboard-formatted status grid
+```
 
-TEL provides pre-formatted view functions for dashboard consumption:
+**Schema:**
+```q
+.tel.schemaStatus[]     / Schema validation status
+```
 
-| Function | Description |
-|----------|-------------|
-| `.tel.vsFhStatus[]` | Feed handler status grid (formatted) |
-| `.tel.vsSystemResources[]` | System memory per component |
-| `.tel.vsDataVolume[]` | Trade/quote counts per symbol |
-| `.tel.fhStatusTable[]` | Raw feed handler health with computed fields |
+**Health:**
+```q
+.health[]               / Standardized health check
+```
+
+**Raw Tables:**
+```q
+telemetry_latency_fh    / FH latency aggregates
+health_feed_handler     / FH health records
+```
 
 ### Throughput Derivation
 
-Throughput (events per second) is derived from the `cnt` field in latency tables:
+Throughput (events per second) is derived from the `cnt` field:
 
 ```q
 / Events per second = cnt / bucket_size
@@ -272,108 +208,72 @@ Throughput (events per second) is derived from the `cnt` field in latency tables
 eventsPerSec: cnt % 5
 ```
 
-No separate `telemetry_throughput` table is needed — throughput is calculated from existing data.
-
-### Analytics Health
-
-Analytics validity is queried directly from RTE rather than stored in TEL:
-
-```q
-/ Query RTE for VWAP validity
-.rte.getVwap[`BTCUSDT; 5]  / Returns isValid field
-
-/ Query RTE for var-covar validity  
-.rte.getVcov[]  / Returns isValid field
-
-/ Query RTE for order book imbalance
-.rte.getImbalance[`BTCUSDT]  / Returns current state
-```
-
-Dashboards query RTE directly for analytics health indicators.
+No separate throughput table is needed.
 
 ## Rationale
 
 This approach was selected because it:
 
-- Keeps the WDB focused on market data storage and HDB writedown (single responsibility)
-- Keeps the RTE focused on analytics (single responsibility)
-- Keeps the MLE focused on ML feature engineering (single responsibility)
-- Makes TEL the single source of truth for all monitoring
-- Uses consistent pub/sub pattern for health (FH → TP → TEL)
-- **Persistent handles minimize IPC overhead** (2026-01-07)
-- Centralises telemetry logic in TEL where it can evolve easily
-- Allows TEL to query multiple sources (WDB + RTE)
-- Preserves raw per-event latencies in WDB for debugging
-- Provides aggregated views suitable for dashboards
-- Aligns with the ephemeral, exploratory nature of the project
-- Uses 5-second buckets for stable percentiles with sufficient samples
-- Unified handler table enables performance comparison
-- Handler column provides flexibility for future handler types
-- Derives throughput from existing data (no redundant tables)
-- Queries RTE directly for analytics health (no duplication)
+- **Focuses on FH latency**: The most reliable metrics (monotonic-derived)
+- **Subscribes to Chained TP**: Batched data is sufficient for telemetry
+- **Validates schemas**: Catches schema drift early via named indices
+- **Removes E2E latency**: Cross-process wall-clock latency is less reliable
+- **Removes system memory queries**: Simplifies TEL, reduces IPC
+- **Single source for monitoring**: TEL handles all telemetry
+- **Ephemeral stance**: Matches project's exploratory nature
 
 ## Alternatives Considered
 
-### 1. Open/close IPC connections each query cycle (original design)
-Changed (2026-01-07):
-- 4 TCP handshakes per 5-second tick
-- Unnecessary overhead (~4-12ms per tick)
-- File descriptor churn
-- Persistent handles are simple and more efficient
+### 1. Query WDB/RTE for latency data (previous design)
+Changed (2026-01-17):
+- Adds IPC overhead
+- Subscription-based is simpler
+- TEL has all data it needs from market data events
 
-### 2. Telemetry computed in WDB
-Rejected:
-- Mixed storage and computation responsibilities
-- Could not easily capture RTE health metrics
-- Violated single-responsibility principle
+### 2. E2E latency tracking (previous design)
+Removed (2026-01-17):
+- Wall-clock derived, less reliable
+- FH latency (monotonic) is sufficient
+- Simplifies implementation
 
-### 3. FH pre-aggregates into buckets
-Rejected:
-- Adds complexity to C++ feed handlers
-- Reduces flexibility (aggregation logic in compiled code)
-- Loses raw per-event data for debugging
+### 3. System memory tracking (previous design)
+Removed (2026-01-17):
+- Requires IPC to WDB/RTE
+- Not critical for current use case
+- Can be added later if needed
 
-### 4. Separate throughput table
+### 4. Direct TP subscription
 Rejected:
-- Redundant — throughput is trivially derived from `cnt` field
-- Adds table maintenance overhead
-- No additional value
+- Adds load to primary TP
+- Batched data via CTP is sufficient
+- TEL doesn't need tick-by-tick
 
-### 5. Separate analytics health table in TEL
-Rejected:
-- Would require TEL to query RTE for validity flags
-- Duplicates data already available in RTE
-- Dashboard already queries RTE for analytics data
+### 5. Hardcoded field indices
+Rejected (2026-01-18):
+- Brittle, breaks silently on schema change
+- Named indices with validation are safer
+- Minimal overhead for significant reliability gain
 
 ## Consequences
 
 ### Positive
 
-- Clean separation of concerns (WDB stores market data, RTE computes analytics, TEL handles all monitoring)
-- TEL is single source of truth for monitoring (dashboards query one endpoint for telemetry)
-- **Persistent handles eliminate connection overhead** (2026-01-07)
-- Automatic reconnection on connection loss
-- Health uses consistent pub/sub pattern (FH → TP → TEL)
-- Flexible aggregation logic (evolves in TEL without affecting WDB/RTE)
-- Raw data available in WDB for debugging
-- Aggregated data available in TEL for dashboards
-- Consistent ephemeral stance
-- SLO metrics directly queryable
-- 5-second buckets provide stable percentiles
-- Unified handler table enables performance comparison
-- E2E latency tracked for both trades and quotes
-- No redundant tables (throughput derived, analytics health queried)
+- Simple, focused telemetry (FH latency only)
+- Subscription-based (no IPC queries)
+- Schema validation catches drift early
+- Named indices document field positions
+- Matches Chained TP batch interval
+- Low overhead
+- Reliable metrics (monotonic-derived)
+- Dashboard-ready query functions
+- Resilient connection handling
 
 ### Negative / Trade-offs
 
-- Additional process (TEL) to manage
-- Telemetry delayed by query interval (5 seconds)
+- No E2E pipeline latency
+- No system memory tracking
+- 1-second delay from CTP batching (plus 5s aggregation)
 - Telemetry lost on restart
-- No historical trend analysis
-- 15-minute bucket retention limits lookback
-- Handler comparison requires filtering on `handler` column
-- Persistent handles require explicit management (close on shutdown)
-- Analytics health requires dashboard to query RTE directly
 
 These trade-offs are acceptable for the current phase.
 
@@ -384,4 +284,4 @@ These trade-offs are acceptable for the current phase.
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (ephemeral stance)
 - `adr-004-real-time-rolling-analytics-computation.md` (RTE details)
 - `adr-007-visualisation-and-consumption-strategy.md` (dashboard consumption)
-- `adr-009-Order-Book-Architecture.md` (quote handler details)
+- `adr-008-error-handling-strategy.md` (connection resilience)

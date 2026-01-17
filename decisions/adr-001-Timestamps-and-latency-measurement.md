@@ -1,11 +1,12 @@
 # ADR-001: Timestamps and Latency Measurement
 
 ## Status
-Accepted (Updated 2026-01-16)
+Accepted (Updated 2026-01-18)
 
 ## Date
 Original: 2025-12-17
-Updated: 2026-01-16
+Updated: 2026-01-17 (Gap detection implementation, CTP batch interval, MLE details)
+Updated: 2026-01-18 (Standardized health checks on all processes)
 
 ## Context
 This project ingests real-time Binance market data via WebSocket (JSON), normalises it in high-performance C++ feed handlers (Boost.Beast + RapidJSON), and publishes it into a KDB-X environment (tickerplant/WDB) via IPC (kdb+ C API).
@@ -16,7 +17,6 @@ This project ingests real-time Binance market data via WebSocket (JSON), normali
 
 We need consistent timestamping to:
 - Measure latency within feed handlers reliably (parsing, normalisation, IPC send).
-- Estimate end-to-end latency through the kdb pipeline.
 - Correlate events across components (FH, TP, WDB, downstream).
 - Support debugging during reconnect/recovery scenarios.
 
@@ -30,13 +30,16 @@ For trade events, `T` and `E` may be equal but are treated as distinct fields. Q
 
 | Acronym | Definition |
 |---------|------------|
+| CTP | Chained Tickerplant (batched publisher) |
 | FH | Feed Handler |
 | HDB | Historical Database |
 | IPC | Inter-Process Communication |
 | MLE | Machine Learning Engine |
 | NTP | Network Time Protocol |
 | PTP | Precision Time Protocol (IEEE 1588) |
+| RDB | Real-time Database (query-only, receives batched data) |
 | RTE | Real-Time Engine |
+| SIG | Signal Generator (future) |
 | SLO | Service-Level Objective |
 | TEL | Telemetry |
 | TP | Tickerplant |
@@ -137,10 +140,18 @@ For each L2 quote snapshot published, the feed handler captures:
 |-------|-------------|------|
 | `tpRecvTimeUtcNs` | TP receive time captured at ingest (`.z.p` converted to nanoseconds since epoch) | nanoseconds since epoch |
 | `wdbRecvTimeUtcNs` | Time the update is received in the WDB (nanoseconds since epoch) | nanoseconds since epoch |
+| `rdbRecvTimeUtcNs` | Time the update is received in the RDB (nanoseconds since epoch) | nanoseconds since epoch |
+
+**MLE (Machine Learning Engine) timestamps:**
+- MLE receives trades tick-by-tick from primary TP on the hot path.
+- MLE does not add a receive timestamp to avoid hot path overhead.
+- Signal latency can be inferred from bar emission time vs. last trade timestamp in the bar.
+- MLE uses vector-based state (O(1) array access) for minimal per-trade overhead.
 
 **Notes:**
 - Monotonic instants are not stored as absolute values; only derived durations are recorded.
 - Durations are stored in microseconds for practical precision without excessive storage overhead.
+- WDB receives tick-by-tick from primary TP; RDB receives batched data from Chained TP (1-second batches).
 
 ### 3) Schema and Storage
 
@@ -156,7 +167,8 @@ For this exploratory project, all timestamp and latency fields are stored **per-
 - `tradeId`
 - Normalised business fields (sym, price, qty, buyerIsMaker, etc.)
 - `tpRecvTimeUtcNs`
-- `wdbRecvTimeUtcNs`
+- `wdbRecvTimeUtcNs` (WDB only)
+- `rdbRecvTimeUtcNs` (RDB only)
 
 **Quote table (`quote_binance`) stores:**
 - `exchEventTimeMs` (from depth update)
@@ -167,36 +179,27 @@ For this exploratory project, all timestamp and latency fields are stored **per-
 - L2 order book snapshot (bidPrice1-5, bidQty1-5, askPrice1-5, askQty1-5)
 - `isValid` (order book synchronization status flag)
 - `tpRecvTimeUtcNs`
-- `wdbRecvTimeUtcNs`
+- `wdbRecvTimeUtcNs` (WDB only)
+- `rdbRecvTimeUtcNs` (RDB only)
 
-**Telemetry tables store aggregated metrics (per handler type):**
+**Telemetry tables store aggregated FH metrics (per handler type):**
 - Time bucket (e.g., 5-second buckets)
 - Handler identifier (`trade_fh` or `quote_fh`)
 - Symbol
-- Event counts
-- Latency percentiles (p50, p95) computed from per-event fields
-- Max values for spike detection
+- Percentile metrics (p50, p95, max) for `fhParseUs` and `fhSendUs`
+- Event count
 
-Rationale for per-event storage:
-- Exploratory project with single user; schema "pollution" is not a concern
-- Enables debugging specific events with their exact latency values
-- Simplifies implementation (single message path, no separate telemetry routing)
-- Aggregation is still performed for dashboard consumption (see ADR-005)
-
-### 4) Latency Metrics Definitions
+### 4) Latency Metrics
 
 **Feed handler segment latencies (monotonic-derived, always trusted):**
 
-| Metric | Trade Handler | Quote Handler |
-|--------|---------------|---------------|
-| `fh_parse_us` | JSON parse + field extraction | JSON parse + order book update + L2 extraction |
-| `fh_send_us` | IPC message serialization | L2 snapshot construction + IPC serialization |
+| Metric | Definition | Unit | Notes |
+|--------|------------|------|-------|
+| `fhParseUs` | JSON parse + normalisation | microseconds | Trade: simple parse; Quote: includes book update |
+| `fhSendUs` | IPC message build + send | microseconds | Similar for both handlers |
 
-**Expected latency ranges (p95, typical conditions):**
-- **Trade Handler:** parse ~20-50μs, send ~5-10μs
-- **Quote Handler:** parse ~100-300μs, send ~5-10μs
-
-Quote handler parse time is significantly higher due to:
+**Quote handler additional work in `fhParseUs`:**
+- JSON parse (similar to trade)
 - Stateful order book management (apply bids/asks updates)
 - L2 extraction from full order book
 - Change detection logic for publish throttling
@@ -209,8 +212,8 @@ All timestamps use nanoseconds since epoch. Unit conversions are explicit in for
 |--------|------------|---------|-------|
 | `market_to_fh_ms` | Binance to FH receive | `(fhRecvTimeUtcNs / 1e6) - exchEventTimeMs` | Indicative only; includes network + exchange semantics; may be negative if clocks are misaligned |
 | `fh_to_tp_ms` | FH send to TP receive | `(tpRecvTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | Same-unit subtraction, then convert to ms |
-| `tp_to_wdb_ms` | TP receive to WDB receive | `(wdbRecvTimeUtcNs - tpRecvTimeUtcNs) / 1e6` | |
-| `e2e_system_ms` | FH receive to WDB receive | `(wdbRecvTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | Full system latency |
+
+**Note:** TEL focuses on FH latency metrics (`fhParseUs`, `fhSendUs`) as these are the most reliable (monotonic-derived). Cross-process latencies are available for debugging but not primary SLO targets.
 
 **Handler-specific considerations:**
 - Trade handler: 1 message in → 1 event out (simple flow)
@@ -243,7 +246,7 @@ SLOs should explicitly state:
 - Whether invalid order book states (quote_fh) are included or excluded
 
 **Example SLO statement:**
-> "Trade feed handler (trade_fh) p95 end-to-end latency (FH receive to WDB receive) shall be < 10ms for BTCUSDT, measured over 1-minute windows, excluding reconnection bursts."
+> "Trade feed handler (trade_fh) p95 parse latency shall be < 100μs for BTCUSDT, measured over 1-minute windows, excluding reconnection bursts."
 
 ### 6) Clock Synchronisation Trust Model
 
@@ -273,11 +276,13 @@ system "g 0"   / Deferred GC - memory recycled internally
 | Process | Port | GC Mode | Rationale |
 |---------|------|---------|-----------|
 | TP | 5010 | Deferred | High message throughput |
-| WDB | 5012 | Deferred | Frequent inserts, intraday writedown |
-| RTE | 5013 | Deferred | Hot path updates + timer cleanup |
-| TEL | 5014 | Deferred | Periodic queries and aggregation |
-| MLE | 5015 | Deferred | Hot path accumulator updates |
-| LOG | - | On-demand | Run manually for cleanup tasks |
+| WDB | 5011 | Deferred | Frequent inserts, intraday writedown |
+| MLE | 5012 | Deferred | Hot path accumulator updates |
+| SIG | 5013 | Deferred | Signal generation (future) |
+| Chained TP | 5014 | Deferred | Batched publishing |
+| RTE | 5015 | Deferred | Dashboard analytics |
+| TEL | 5016 | Deferred | Periodic FH latency aggregation |
+| RDB | 5017 | Deferred | User queries |
 
 **Deferred GC (`-g 0`):**
 - Memory recycled internally, not returned to OS
@@ -309,7 +314,8 @@ Reference: *Building Real-Time Event-Driven KDB-X Systems* §Performance Tuning:
 - `fhSeqNo` provides additional ordering context for diagnostics.
 
 **Gap detection:**
-- `fhSeqNo` gaps indicate missed events at the feed handler level.
+- `fhSeqNo` gaps are actively detected at the TP level for trades. TP logs gaps and tracks counters (`.tp.gaps.trade`, `.tp.missed.trade`, `.tp.restarts.trade`). Query via `.tp.status[]`.
+- Quote gap detection is deferred due to high message rate causing false positives.
 - `tradeId` gaps (per symbol) may indicate missed events at the exchange level, though Binance does not guarantee contiguous trade IDs.
 
 #### Quote Events
@@ -341,7 +347,9 @@ Reference: *Building Real-Time Event-Driven KDB-X Systems* §Performance Tuning:
 - Explicit SLO percentiles and windows provide clear targets for measurement.
 - Sequence numbers support future recovery/replay without schema changes.
 - Handler-specific characteristics (trade vs quote) are explicitly documented and measurable.
-- Telemetry system can compare trade vs quote performance side-by-side.
+- TEL focuses on FH latency (monotonic-derived) for reliable metrics.
+- Standardized `.health[]` function on all kdb+ processes provides consistent monitoring interface.
+- Trade gap detection at TP level provides real-time visibility into data loss.
 
 ### Negative / Trade-offs
 - End-to-end latency across hosts can be misleading without good clock sync; requires explicit trust rules and monitoring.

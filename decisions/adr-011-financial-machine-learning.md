@@ -1,10 +1,10 @@
 # ADR-011: Financial Machine Learning Engine
 
 ## Status
-Accepted (Updated 2026-01-16)
+Accepted (Updated 2026-01-18)
 
 ## Date
-2026-01-15 (Updated 2026-01-16)
+2026-01-15 (Updated 2026-01-16, 2026-01-17, 2026-01-18)
 
 ## Context
 
@@ -18,14 +18,14 @@ A core objective is to implement **information-driven bars** as described in Mar
 
 - **Dollar Imbalance Bars (DIB)**: Sample when net buy/sell dollar pressure exceeds threshold
 - **Dollar Runs Bars (DRB)**: Sample when persistent one-sided dollar flow exceeds threshold
-- **Triple Barrier Labeling**: Label bars for supervised ML based on future price movement
+- **Position Signals**: Generate trading positions based on bar characteristics
 
 These features must:
 - Process trades tick-by-tick in real-time
 - Weight trades by economic significance (dollar value, not tick count)
 - Adapt thresholds dynamically to changing market conditions
 - Support per-symbol configuration for different liquidity profiles
-- Generate labels suitable for ML classification tasks
+- Generate position signals suitable for trading decisions
 
 A decision is required on **where and how these ML features are computed**.
 
@@ -34,12 +34,14 @@ A decision is required on **where and how these ML features are computed**.
 | Acronym | Definition |
 |---------|------------|
 | AFML | Advances in Financial Machine Learning (López de Prado) |
+| CTP | Chained Tickerplant (batched publisher) |
 | DIB | Dollar Imbalance Bars |
 | DRB | Dollar Runs Bars |
 | EWMA | Exponential Weighted Moving Average |
 | HDB | Historical Database |
 | MLE | Machine Learning Engine |
 | RTE | Real-Time Engine |
+| SIG | Signal Generator (future) |
 | TIB | Tick Imbalance Bars (not implemented) |
 | TP | Tickerplant |
 | VIB | Volume Imbalance Bars (not implemented) |
@@ -53,7 +55,7 @@ ML feature computation will be performed in a dedicated **Machine Learning Engin
 |---------|----------|-------------|--------|
 | Dollar Imbalance Bars | Cumulative signed dollar flow | Hot (every trade) | OHLCV bars |
 | Dollar Runs Bars | Consecutive same-direction flow | Hot (every trade) | OHLCV bars |
-| Triple Barrier Labels | Forward-looking price targets | Cold (timer, 30s) | Classification labels |
+| Position Signals | Buy/sell dollar percentage | On bar completion | Position (-1, 0, +1) |
 | Adaptive Thresholds | EWMA of bar characteristics | On bar completion | Per-symbol thresholds |
 
 ### Why Dollar-Based (Not Tick or Volume)
@@ -72,23 +74,36 @@ Dollar-based bars ensure:
 ### Architectural Placement
 
 ```
-TP :5010 ──┬──► WDB :5012 (storage: trade_binance, quote_binance → HDB)
-           │
-           ├──► RTE :5013 (analytics: VWAP, Imbalance, VarCovar)
-           │
-           └──► MLE :5015 (ML features: DIB, DRB, Labels)
+TP:5010 ──┬──► WDB:5011 (storage → HDB)
+          │
+          ├──► MLE:5012 (tick-by-tick: DIB, DRB, Positions)
+          │
+          └──► CTP:5014 (batched 1s)
+                    │
+                    └──► RTE:5015 (dashboard: VWAP, vol, OBI)
 ```
 
-- The **MLE** subscribes directly to the tickerplant for live updates
-- The **MLE** is a peer subscriber alongside WDB and RTE
-- The **MLE** maintains its own state for bar computation and labeling
+- The **MLE** subscribes directly to the tickerplant for tick-by-tick trade updates
+- The **MLE** is a peer subscriber alongside WDB (on the hot path)
+- The **MLE** maintains its own state for bar computation and position signals
+- **RTE** subscribes to Chained TP for batched dashboard analytics (different purpose)
+
+### Connection Resilience
+
+MLE implements resilient connection handling (see ADR-008):
+- Exponential backoff on TP connection failure
+- Timer-based reconnection attempts
+- Process starts in degraded mode if TP unavailable
+- Resumes normal operation when connection restored
+- Reports connection state via `.health[]`
 
 ### Processing Mode
 
 The MLE processes updates **tick-by-tick**:
 - Each incoming trade updates the dollar imbalance accumulator
 - Bar emission occurs when threshold is exceeded (not on timer)
-- Labeling runs on timer (30s) for matured bars
+- Position signals generated on bar completion
+- Cleanup runs on timer (30s) for stale bars
 
 ---
 
@@ -189,7 +204,44 @@ drb_bars:([]
 
 ---
 
-### 3. Adaptive Thresholds
+### 3. Position Signals
+
+**Concept:** Generate trading positions based on the buy/sell dollar percentage in completed DIB bars.
+
+**Signal Logic:**
+```q
+.mle.cfg.signal.buyThreshold:65.0;    / Enter long if buyDollarPct > 65%
+.mle.cfg.signal.sellThreshold:35.0;   / Enter short if buyDollarPct < 35%
+
+/ On bar completion:
+newPos:$[buyPct > buyThreshold; 1h;        / Long
+         buyPct < sellThreshold; -1h;       / Short
+         currentPos];                       / Hold
+```
+
+**Position State (per symbol):**
+```q
+.mle.position:`short$();          / Current position: -1, 0, or 1
+.mle.positionTime:`timestamp$();  / Timestamp of last position change
+.mle.positionPrice:`float$();     / Price at last position change
+```
+
+**Position History Table:**
+```q
+positions:([]
+    time:`timestamp$();           / Position change time
+    sym:`symbol$();               / Symbol
+    position:`short$();           / New position: -1, 0, or 1
+    price:`float$();              / Price at position change
+    trigger:`float$();            / buyDollarPct that triggered change
+    dollarVolume:`float$();       / Bar dollar volume
+    ticks:`long$()                / Bar tick count
+);
+```
+
+---
+
+### 4. Adaptive Thresholds
 
 Static thresholds don't work across:
 - Different symbols (BTC vs SOL have different volumes)
@@ -226,97 +278,17 @@ Rule of thumb: threshold ≈ 0.1% of daily dollar volume for ~100 bars/day.
 
 ---
 
-## Triple Barrier Labeling
-
-### Concept
-
-For supervised ML, we need labels. The triple barrier method labels each bar based on which price barrier is hit first:
-
-```
-         Upper Barrier (+profit target)
-              ─────────────────────
-                    ╱
-Entry Price ───────●
-                    ╲
-              ─────────────────────
-         Lower Barrier (-stop loss)
-         
-         |←── Vertical Barrier (time limit) ──→|
-```
-
-### Barrier Configuration
-
-```q
-.mle.cfg.label.profitTarget:0.001;    / 0.1% profit target
-.mle.cfg.label.stopLoss:0.001;        / 0.1% stop loss
-.mle.cfg.label.horizonBars:10;        / 10 bars forward
-.mle.cfg.label.horizonTimeMs:300000;  / 5 minutes max
-.mle.cfg.label.volLookbackBars:20;    / 20 bars for vol estimate
-```
-
-### Volatility-Adjusted Barriers
-
-Fixed barriers don't account for different volatility regimes. We adjust barriers based on recent volatility:
-
-```q
-/ Calculate recent volatility from bar returns
-vol = sqrt(var(log(close[t] / close[t-1])))
-
-/ Adjust barriers by volatility
-upperBarrier = entry × (1 + profitTarget × vol/baseVol)
-lowerBarrier = entry × (1 - stopLoss × vol/baseVol)
-```
-
-### Label Values
-
-| Label | Meaning | Barrier Hit |
-|-------|---------|-------------|
-| +1 | Long profitable | Upper barrier hit first |
-| -1 | Short profitable | Lower barrier hit first |
-| 0 | No move | Neither barrier hit within horizon |
-
-### Data Structure
-
-```q
-labeled_bars:([]
-    time:`timestamp$();           / Bar time
-    sym:`symbol$();
-    entryPrice:`float$();         / Price at bar close
-    label:`short$();              / +1, -1, or 0
-    exitPrice:`float$();          / Price when barrier hit
-    exitTime:`timestamp$();       / Time when barrier hit
-    barsToExit:`long$();          / Bars until exit
-    returnPct:`float$();          / Actual return achieved
-    volAtEntry:`float$();         / Volatility at entry
-    upperBarrier:`float$();       / Upper barrier price
-    lowerBarrier:`float$()        / Lower barrier price
-);
-```
-
-### Labeling Algorithm
-
-1. For each unlabeled DIB bar older than horizon
-2. Get subsequent bars up to horizon
-3. Calculate vol-adjusted barriers
-4. Scan forward for barrier breach
-5. If neither within horizon → vertical hit
-6. Assign label based on which barrier hit first
-
-**Timer Execution:**
-Labels are computed on a 30-second timer (cold path) since they require future data.
-
----
-
 ## State Schema Summary
 
 | State | Type | Memory | Update | Cleanup |
 |-------|------|--------|--------|---------|
 | dib_bars | Table | ~1MB/day | On threshold breach | Timer (30s) |
 | drb_bars | Table | ~500KB/day | On threshold breach | Timer (30s) |
-| labeled_bars | Table | ~1MB/day | Timer (30s) | Timer (30s) |
-| .mle.theta | Dictionary | ~100 bytes | Every trade | On bar emit |
-| .mle.ewmaThreshold | Dictionary | ~100 bytes | On bar emit | Never (persists) |
-| .mle.buyRun/.sellRun | Dictionary | ~100 bytes | Every trade | On bar emit |
+| positions | Table | ~100KB/day | On position change | Timer (30s) |
+| .mle.theta | Vector | ~100 bytes | Every trade | On bar emit |
+| .mle.ewmaThreshold | Vector | ~100 bytes | On bar emit | Never (persists) |
+| .mle.buyRun/.sellRun | Vector | ~100 bytes | Every trade | On bar emit |
+| .mle.position | Vector | ~100 bytes | On bar emit | Never |
 
 **Retention:**
 ```q
@@ -329,7 +301,8 @@ Labels are computed on a 30-second timer (cold path) since they require future d
 
 **Status & Monitoring:**
 ```q
-.mle.status[]                     / Current accumulator state
+.health[]                         / Standardized health check (incl. connection state)
+.mle.status[]                     / Current accumulator state + positions
 .mle.thresholds[]                 / Current adaptive thresholds
 .mle.resetThreshold[`SOLUSDT]     / Reset symbol to initial threshold
 .mle.resetAllThresholds[]         / Reset all to initial thresholds
@@ -343,20 +316,22 @@ Labels are computed on a 30-second timer (cold path) since they require future d
 .mle.barStats[]                   / Bar statistics by symbol
 ```
 
-**Labeling:**
+**Position Interface:**
 ```q
-.mle.labelStats[]                 / Label distribution and win rates
-.mle.getLabeled[`BTCUSDT; 10]     / Last 10 labeled bars
-.mle.getLabeled[`; 20]            / Last 20 labeled bars (all symbols)
+.mle.getPosition[`BTCUSDT]        / Current position (-1/0/1)
+.mle.getPositions[]               / All current positions
+.mle.getPositionHistory[`BTCUSDT; 10]  / Last 10 position changes
+.mle.getPositionHistory[`; 20]    / All symbols
+.mle.positionStats[]              / Position change statistics
 ```
 
-**Example Output - .mle.labelStats[]:**
+**Example Output - .mle.getPositions[]:**
 ```
-sym    | bars longWins shortWins noMove winRate  avgRet
--------| ------------------------------------------------
-BTCUSDT| 134  67       43        10     55.8%    0.009%
-ETHUSDT| 89   21       12        48     25.9%   -0.015%
-SOLUSDT| 22   8        14        0      36.4%   -0.008%
+sym     position price    time
+---------------------------------------------
+BTCUSDT 1        95448.21 2026.01.18D10:23:45
+ETHUSDT -1       3291.44  2026.01.18D10:22:31
+SOLUSDT 0        144.39   2026.01.18D09:15:22
 ```
 
 ---
@@ -368,7 +343,6 @@ The MLE timer runs every 30 seconds:
 ```q
 .z.ts:{[]
     .mle.cleanup[];       / Remove bars older than 24 hours
-    .mle.labelBars[];     / Label matured DIB bars
 };
 ```
 
@@ -380,16 +354,17 @@ On MLE restart:
 
 | Step | Action |
 |------|--------|
-| 1 | Replay today's TP log file (if exists) |
-| 2 | Run cleanup to remove stale bars |
-| 3 | Subscribe to tickerplant for live updates |
-| 4 | Begin accumulating new bars |
-| 5 | Adaptive thresholds restored from replay |
+| 1 | Attempt connection to TP (with exponential backoff if unavailable) |
+| 2 | Replay today's TP log file (if exists) |
+| 3 | Run cleanup to remove stale bars |
+| 4 | Subscribe to tickerplant for live updates |
+| 5 | Begin accumulating new bars |
+| 6 | Adaptive thresholds restored from replay |
 
 **Warm-up Times:**
 - DIB/DRB Bars: Immediate (first threshold breach)
 - Adaptive Thresholds: ~10 bars for stabilization
-- Labels: horizon time + vol lookback (5 min + 20 bars)
+- Positions: Immediate (computed on bar completion)
 
 ---
 
@@ -399,18 +374,18 @@ On MLE restart:
 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
+| Symbol lookup | <100ns | O(1) hash lookup |
 | Tick rule | <100ns | Price comparison |
-| Theta accumulation | <100ns | Addition |
+| Theta accumulation | <100ns | Array addition |
 | Run tracking | <100ns | Conditional add/reset |
-| Threshold check | <100ns | Comparison |
+| Threshold check | <100ns | Array comparison |
 | Bar emission | <10μs | Table insert |
+| Position check | <1μs | Threshold comparison |
 
 ### Cold Path (Timer)
 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
-| Label single bar | <1ms | Forward scan through bars |
-| Label all matured | <100ms | Batch processing |
 | Cleanup | <10ms | Delete from tables |
 
 ### Memory (3 symbols, 24 hours)
@@ -419,9 +394,9 @@ On MLE restart:
 |-----------|--------|-------|
 | dib_bars | ~1MB | ~300 bars/symbol × 13 columns |
 | drb_bars | ~500KB | ~150 bars/symbol × 13 columns |
-| labeled_bars | ~1MB | ~300 bars/symbol × 16 columns |
-| State dictionaries | ~1KB | Accumulators, thresholds |
-| **Total** | **~3MB** | Scales linearly with symbols |
+| positions | ~100KB | ~50 changes/symbol × 7 columns |
+| State vectors | ~1KB | Accumulators, thresholds |
+| **Total** | **~2MB** | Scales linearly with symbols |
 
 ---
 
@@ -442,15 +417,15 @@ On MLE restart:
 - **Per-symbol tuning**: Automatic, not manual
 - **EWMA stability**: Slow adaptation prevents oscillation
 
-### Volatility-Adjusted Labels:
-- **Regime-aware**: Barriers scale with market conditions
-- **Comparable labels**: Same "difficulty" across periods
-- **Better ML signal**: Labels reflect meaningful moves, not noise
+### Position Signals:
+- **Simple rules**: Buy/sell percentage thresholds
+- **Immediate**: Computed on bar completion
+- **Per-symbol**: Independent positions per instrument
 
 ### Separate Process (Not in RTE):
-- **Different consumers**: RTE serves dashboards, MLE serves ML pipelines
+- **Different consumers**: RTE serves dashboards, MLE serves trading
 - **Different lifecycles**: MLE config changes more frequently
-- **Clean separation**: Analytics vs feature engineering
+- **Clean separation**: Analytics vs signal generation
 
 ---
 
@@ -469,8 +444,8 @@ Rejected:
 
 ### 3. Compute bars in RTE
 Rejected:
-- Different update frequencies (RTE has 5s timer for vcov)
-- Different consumers (dashboards vs ML)
+- Different update frequencies (RTE has batched subscription)
+- Different consumers (dashboards vs trading)
 - Cleaner to separate concerns
 
 ### 4. Fixed thresholds only
@@ -479,18 +454,11 @@ Rejected:
 - Requires manual tuning per symbol
 - EWMA provides automatic adaptation
 
-### 5. Time-based labeling horizon only
-Rejected:
-- Bar-based horizon captures "market time"
-- Combined approach (bars AND time) is more robust
-- Aligns with López de Prado methodology
-
-### 6. Store DIB/DRB in HDB
-Rejected:
-- Parameters change during research
-- Labels are path-dependent (future data)
-- Better to compute from raw ticks on demand
-- Raw tick data is source of truth
+### 5. Triple Barrier Labeling
+Deferred:
+- Labels require future data (not suitable for real-time signals)
+- Can be added for historical backtest
+- Position signals provide immediate actionable output
 
 ---
 
@@ -503,17 +471,16 @@ Rejected:
 - Cross-asset comparable thresholds
 - Adaptive to market regime
 - Per-symbol configuration
-- Triple barrier labels for supervised ML
-- Volatility-adjusted barriers
+- Position signals for trading decisions
 - Low latency hot path (<1μs)
-- Production-grade implementation
+- Connection resilience with exponential backoff
+- Standardized `.health[]` for monitoring
 
 ### Negative / Trade-offs
 
-- Labels require warm-up (horizon time + vol lookback)
 - Adaptive thresholds need ~10 bars to stabilize
 - Replay from TP logs required for state recovery
-- Volatility lookback requires sufficient bar history
+- Position signals are simple (no ML model yet)
 
 ---
 
@@ -521,12 +488,12 @@ Rejected:
 
 | Enhancement | Trigger |
 |-------------|---------|
+| Position persistence | Save/load positions across restart |
+| Signal latency metrics | Track time from trade to position change |
+| Triple Barrier Labeling | Historical backtest requirement |
 | Meta-labeling | Position sizing based on model confidence |
 | Fractional differentiation | Stationarity while preserving memory |
-| Sample weights | Uniqueness-based weighting for overlapping labels |
 | Cross-asset events | Detect correlated liquidation cascades |
-| HDB integration | Batch computation for historical backtest |
-| Feature engineering | Structural breaks, entropy features |
 
 ---
 
@@ -538,5 +505,6 @@ Rejected:
   - Chapter 4: Sample Weights
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` (tick-by-tick precedent)
 - `adr-004-Real-Time-Analytics-Computation.md` (RTE architecture, peer pattern)
+- `adr-008-error-handling-strategy.md` (connection resilience)
 - `rte.q` (peer process for analytics)
 - `mle.q` (implementation)

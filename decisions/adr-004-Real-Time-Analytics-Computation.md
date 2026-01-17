@@ -1,11 +1,11 @@
 # ADR-004: Real-Time Analytics Computation
 
 ## Status
-Accepted (Updated 2026-01-16)
+Accepted (Updated 2026-01-17)
 
 ## Date
 Original: 2025-12-17
-Updated: 2026-01-11, 2026-01-16
+Updated: 2026-01-11, 2026-01-16, 2026-01-17
 
 ## Context
 
@@ -13,31 +13,33 @@ The system ingests real-time market data from Binance via two C++ feed handlers:
 - **Trade Feed Handler**: Individual trade executions
 - **Quote Feed Handler**: L2 order book depth updates
 
-A core objective of the project is to compute **real-time analytics** on this live data:
+A core objective of the project is to compute **real-time analytics** on this live data for dashboard display:
 - **VWAP (Volume-Weighted Average Price)** from trades
+- **Daily Volatility** from trades (annualized)
+- **Order Book** from L2 quotes (latest snapshot)
 - **Order Book Imbalance** from L2 quotes (with EMA smoothing)
-- **Variance-Covariance Matrix** from trades (cross-asset correlation)
 
 These analytics must:
-- Update incrementally as new data arrives
+- Update as batched data arrives (1-second batches)
 - Be query-consistent
-- Reflect recent data with low latency
+- Reflect recent data with acceptable latency for dashboard display
 - Scale efficiently with message volume
-- Avoid full rescans of historical data on each update
 
 A decision is required on **where and how these analytics are computed**.
 
-**Note:** Latency tracking has been moved to the Telemetry process (tel.q) as per ADR-005.
+**Note:** RTE subscribes to Chained TP (batched 1s) since it serves dashboard display, not latency-sensitive trading decisions.
 
 ## Notation
 
 | Acronym | Definition |
 |---------|------------|
+| CTP | Chained Tickerplant (batched publisher) |
 | EMA | Exponential Moving Average |
 | IPC | Inter-Process Communication |
 | L2 | Level 2 (top 5 bid/ask levels) |
 | MLE | Machine Learning Engine |
 | OBI | Order Book Imbalance |
+| RDB | Real-time Database (query-only) |
 | RTE | Real-Time Engine |
 | TP | Tickerplant |
 | VWAP | Volume-Weighted Average Price |
@@ -47,428 +49,250 @@ A decision is required on **where and how these analytics are computed**.
 
 Real-time analytics will be computed in a **Real-Time Engine (RTE)** process using distinct strategies per metric:
 
-| Metric | Strategy | Window | Update Path |
-|--------|----------|--------|-------------|
-| VWAP | Time-bucketed aggregation | 1-10 min | Hot (every trade) |
-| Order Book Imbalance | Latest + EMA smoothing | Point-in-time | Hot (every quote) |
-| OBI History | Rolling table | 7 min | Hot (every quote) |
-| L2 Order Book | Latest snapshot | Point-in-time | Hot (every quote) |
-| Variance-Covariance | Resampled calculation | 1 hour | Cold (timer, 5s) |
+| Metric | Strategy | Description | Update Path |
+|--------|----------|-------------|-------------|
+| VWAP | Cumulative daily | Sum(price×qty) / Sum(qty) | Batched (1s) |
+| Daily Vol | Rolling 30-sec returns | Annualized stddev of log returns | Batched (1s) |
+| Order Book | Latest snapshot | L5 bid/ask prices and quantities | Batched (1s) |
+| Smooth OBI | EMA of raw OBI | Smoothed order book imbalance | Batched (1s) |
 
 ### Architectural Placement
 
-- The **WDB** stores raw trade and quote events and writes to HDB.
-- The **RTE** computes and maintains analytics as a dedicated process.
-- The RTE is a peer to the WDB, not downstream of it during normal operation.
+```
+TP:5010 ──┬──► WDB:5011 (tick-by-tick → HDB)
+          │
+          ├──► MLE:5012 (tick-by-tick, trades only)
+          │
+          └──► CTP:5014 (batched 1s)
+                    │
+                    ├──► RTE:5015 (VWAP, vol, OBI)
+                    ├──► TEL:5016 (FH latency)
+                    └──► RDB:5017 (user queries)
+```
 
 ### Subscription Model
 
-- The RTE subscribes **directly to the tickerplant** for live updates.
-- The RTE is a peer subscriber alongside the WDB and MLE.
-- The RTE does not query the WDB during normal operation (only for recovery).
-
-```
-TP:5010 ──┬──► WDB:5012 (storage: trade_binance, quote_binance → HDB)
-          │
-          ├──► RTE:5013 (analytics: VWAP, Imbalance, VarCovar)
-          │
-          └──► MLE:5015 (information-driven bars: DIB, DRB)
-```
+- RTE subscribes to **Chained TP** (port 5014) for batched updates
+- Batched delivery is acceptable for dashboard display (1-second delay)
+- Reduces load on primary TP hot path
 
 ### Processing Mode
 
-The RTE processes updates **tick-by-tick**:
-- Each incoming trade/quote immediately updates state
-- Analytics are recomputed on each update (hot path) or timer (cold path)
-- No internal batching or buffering
-
-Rationale:
-- Matches FH→TP tick-by-tick model (ADR-002)
-- Provides lowest latency for analytics updates
-- Simplifies latency measurement
-- Consistent reasoning across the entire pipeline
+The RTE processes updates in **batches**:
+- Receives batched data every 1 second from Chained TP
+- Updates analytics state for each row in the batch
+- No individual tick latency requirements (dashboard use case)
 
 ---
 
 ## Analytics Implementation
 
-### 1. Trade Buckets (Shared State)
-
-Trade buckets are the **shared foundation** for VWAP and Variance-Covariance calculations. Instead of storing individual trades, RTE aggregates trades into **1-second time buckets**:
-
-| Bucket | Symbol | sumPxQty | sumQty | cnt |
-|--------|--------|----------|--------|-----|
-| 10:00:01 | BTCUSDT | 500000 | 5.4 | 12 |
-| 10:00:02 | BTCUSDT | 480000 | 5.2 | 8 |
-
-**Data Structure:**
-```q
-tradeBuckets:([]
-  sym:`symbol$();
-  bucket:`timestamp$();     / 1-second granularity
-  sumPxQty:`float$();       / Σ(price × quantity)
-  sumQty:`float$();         / Σ(quantity)
-  cnt:`long$()              / Trade count
-);
-`sym`bucket xkey `tradeBuckets;  / Keyed for O(1) upsert
-```
-
-**Update Algorithm (Hot Path):**
-1. Incoming trade arrives with (time, sym, price, qty)
-2. Floor time to 1-second bucket: `bucket = time - (time mod 1000000000)`
-3. Upsert into keyed table:
-   - If bucket exists: increment sumPxQty, sumQty, cnt
-   - If new bucket: insert new row
-4. This is **O(1)** regardless of number of trades
-
-**Configuration:**
-```q
-.rte.cfg.bucketSec:1;              / 1-second buckets (for VWAP precision)
-.rte.cfg.bucketRetentionMin:65;    / Keep 65 minutes (for 1-hour vcov window)
-```
-
-**Why 1-second buckets with 65-minute retention:**
-- VWAP needs fine granularity (1-sec) for precision
-- Var-covar needs long window (60-min) for meaningful correlations
-- 65 minutes provides buffer for 1-hour calculations
-
----
-
-### 2. VWAP (Volume-Weighted Average Price)
+### 1. VWAP (Volume-Weighted Average Price)
 
 **Formula:**
 ```
 VWAP = Σ(price × quantity) / Σ(quantity)
 ```
 
-**Query Algorithm:**
-For 5-minute VWAP query:
-1. Calculate cutoff: `cutoff = now - 5 minutes`
-2. Select all buckets: `select from tradeBuckets where sym=s, bucket >= cutoff`
-3. Sum across buckets:
-   ```q
-   totalPxQty: sum sumPxQty
-   totalQty: sum sumQty
-   vwap: totalPxQty % totalQty
-   ```
-4. This is **O(buckets)** = O(300) for 5-minute window, not O(trades) = O(10,000+)
+**Data Structure:**
+```q
+/ sym -> (sumPxQty; sumQty; lastPrice; tradeCount)
+.rte.st.vwap:()!();
+```
 
-**Performance Characteristics:**
-
-| Metric | Per-Trade Storage | Bucketed Storage |
-|--------|-------------------|------------------|
-| Insert time | O(n) growing | O(1) constant |
-| Memory/symbol | ~5MB (10k trades) | ~50KB (300 buckets) |
-| Query time (5min) | O(n) scan | O(buckets) ≈ O(1) |
-| Memory efficiency | 1x | **100x better** |
+**Update Algorithm:**
+```q
+.rte.updVwap:{[s;price;qty]
+  pxqty:price * qty;
+  $[s in key .rte.st.vwap;
+    .rte.st.vwap[s]+:(pxqty; qty; 0f; 1j);
+    .rte.st.vwap[s]:(pxqty; qty; price; 1j)
+  ];
+  .rte.st.vwap[s;2]:price;  / Update last price
+  };
+```
 
 **Query Interface:**
 ```q
-/ Get 5-minute VWAP for BTCUSDT
-.rte.getVwap[`BTCUSDT; 5]
+.rte.getVwap[]
 
-/ Returns single-row table:
-sym     vwap     totalQty tradeCount isValid
---------------------------------------------
-BTCUSDT 92521.72 0.185    25         1
+/ Returns:
+sym     vwap     lastPrice volume   trades
+------------------------------------------
+BTCUSDT 95448.8  95448.21  6.5112   2397
+SOLUSDT 144.40   144.39    5602.73  3132
+ETHUSDT 3291.44  3291.51   115.55   3738
 ```
-
-**Validity Logic:**
-- `isValid = 1` if `tradeCount > 10` (sufficient samples)
-- `isValid = 0` otherwise (insufficient data)
 
 ---
 
-### 3. Variance-Covariance Matrix
+### 2. Daily Volatility
 
-**Purpose:** Measure cross-asset correlation and volatility for portfolio analysis.
-
-**Implementation Strategy: Resampled Calculation (Cold Path)**
-
-Var-covar uses a different time scale than VWAP:
-- **VWAP**: 1-second buckets, short windows (1-10 min)
-- **Var-covar**: 30-second resampling, long window (1 hour)
-
-**Why different time scales:**
-- 1-second returns are noisy (price barely moves)
-- 30-second returns capture meaningful price changes
-- 1-hour window provides ~120 data points for stable statistics
-
-**Data Flow:**
+**Formula:**
 ```
-tradeBuckets (1-sec) → Resample to 30-sec → Log returns → Covariance matrix
-```
-
-**Algorithm:**
-1. Extract prices from 1-sec buckets within window
-2. Resample to 30-sec buckets (last price per bucket)
-3. Forward-fill missing prices (assume unchanged)
-4. Compute log returns: `log(price[t] / price[t-1])`
-5. Find valid indices (all symbols have data)
-6. Build var-covar matrix using `cov` function
-
-**Data Structures:**
-```q
-/ Latest matrix (updated every 5 seconds by timer)
-.rte.vcov.latest:`syms`matrix`window`buckets`isValid!(...)
-
-/ History for charting (flattened)
-.rte.vcov.history:([] time:`timestamp$(); sym1:`symbol$(); sym2:`symbol$(); covar:`float$())
+Vol = sqrt(periods_per_year) × stddev(log_returns)
 ```
 
 **Configuration:**
 ```q
-.rte.cfg.vcovWindowMin:60;      / 1-hour window
-.rte.cfg.vcovBucketSec:30;      / Resample to 30-sec
-.rte.cfg.vcovMinBuckets:100;    / Need ~100 of 120 for valid matrix
-.rte.cfg.vcovRetentionMin:15;   / Keep 15 min of history
+.rte.cfg.volWindowSec:30;       / Return window (30 sec between prices)
+.rte.cfg.volMinReturns:30;      / Minimum returns before displaying vol
+```
+
+**Data Structures:**
+```q
+.rte.st.volPrices:()!();   / sym -> list of (time; price)
+.rte.st.volReturns:()!();  / sym -> list of log returns
+.rte.st.volLatest:()!();   / sym -> (annualizedVol; returnCount; isValid)
+```
+
+**Update Algorithm:**
+1. Store price point with timestamp
+2. Find price from ~30 seconds ago
+3. Calculate log return: `log(price / oldPrice)`
+4. Store return
+5. After 30+ returns, calculate annualized volatility
+
+**Query Interface:**
+```q
+.rte.getVol[]
+
+/ Returns:
+sym     annualizedVol returnCount isValid
+-----------------------------------------
+BTCUSDT 45.2          156         1
+SOLUSDT 72.1          203         1
+ETHUSDT 58.4          189         1
+```
+
+**Validity Logic:**
+- `isValid = 1` if `returnCount >= 30` (sufficient samples)
+- Takes ~15 minutes to become valid (30 returns × 30 sec)
+
+**Edge Case Guards:**
+- Skip if old price is null or <= 0
+- Skip if log return is null or infinite
+- Only update volatility if valid and > 0
+
+---
+
+### 3. Order Book (L5 Snapshot)
+
+**Data Structure:**
+```q
+/ sym -> (bidPrice1-5; bidQty1-5; askPrice1-5; askQty1-5; time)
+.rte.st.book:()!();
+```
+
+**Update Algorithm:**
+```q
+.rte.updBook:{[s;data;time]
+  / data indices: 2-6 bidPrice, 7-11 bidQty, 12-16 askPrice, 17-21 askQty
+  .rte.st.book[s]:data[2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21],time;
+  };
 ```
 
 **Query Interface:**
 ```q
-/ Calculate fresh matrix (any window)
-.rte.getVarCovar[60]
+.rte.getOrderBook[`BTCUSDT]
 
 / Returns:
-syms   | `BTCUSDT`ETHUSDT`SOLUSDT
-matrix | (3x3 covariance matrix)
-window | 60
-buckets| 120
-isValid| 1b
+level bidPrice  bidQty    askPrice  askQty
+------------------------------------------
+1     95448.00  0.523     95448.01  0.412
+2     95447.99  1.234     95448.02  0.891
+3     95447.98  0.876     95448.03  1.023
+4     95447.97  2.145     95448.04  0.567
+5     95447.96  1.567     95448.05  0.789
 
-/ Get latest matrix (from timer)
-.rte.getVcov[]
-
-/ Get correlation matrix (derived)
-.rte.getCorrelation[]
+.rte.getSpread[`BTCUSDT]
 
 / Returns:
-       | BTCUSDT   ETHUSDT   SOLUSDT
--------| -----------------------------
-BTCUSDT| 1         0.576     0.422
-ETHUSDT| 0.576     1         0.532
-SOLUSDT| 0.422     0.532     1
-
-/ Get correlation as table (for dashboard grid)
-.rte.getCorrelationTable[]
-
-/ Get annualized volatility
-.rte.getAnnualizedVol[]
-
-/ Returns:
-BTCUSDT| 0.084
-ETHUSDT| 0.117
-SOLUSDT| 0.317
-
-/ Get covariance history for charting
-.rte.getVcovHistory[`BTCUSDT; `ETHUSDT; 15]
+sym     bid      ask      spread mid
+---------------------------------------
+BTCUSDT 95448.00 95448.01 0.01   95448.005
 ```
-
-**Validity Logic:**
-- `isValid = 1b` when `buckets >= .rte.cfg.vcovMinBuckets` (100)
-- Requires ~50 minutes warm-up for valid 1-hour calculation
-- Matrix is computed but flagged invalid during warm-up
 
 ---
 
 ### 4. Order Book Imbalance (OBI)
 
-**Purpose:** Measure buying vs selling pressure from L2 depth.
-
 **Formula:**
 ```
-OBI = (bidDepth - askDepth) / (bidDepth + askDepth)
-```
-Where depth = sum of quantities across 5 levels.
-
-**Range:** -1 (all asks) to +1 (all bids), 0 = balanced
-
-**EMA Smoothing:**
-Raw OBI is noisy; we apply Exponential Moving Average:
-```
-smOBI[t] = α × OBI[t] + (1 - α) × smOBI[t-1]
+Raw OBI = (bidDepth - askDepth) / (bidDepth + askDepth)
+Smooth OBI = alpha × Raw OBI + (1 - alpha) × Previous Smooth OBI
 ```
 
 **Configuration:**
 ```q
-.rte.cfg.obiAlpha:0.05;        / Lower = smoother (5% weight to new value)
-.rte.cfg.obiThreshold:0.3;     / Threshold for buyer/seller pressure
-.rte.cfg.obiRetentionMin:7;    / Keep 7 minutes of history
+.rte.cfg.obiAlpha:0.05;   / EMA smoothing (lower = smoother)
 ```
 
-**Data Structures:**
+**Data Structure:**
 ```q
-.rte.imb.latest    / Latest OBI per symbol (dict)
-.rte.imb.ema       / EMA state per symbol (dict)
-.rte.imb.history   / Rolling history table
+/ sym -> (rawOBI; smoothOBI; time)
+.rte.st.obi:()!();
 ```
 
-**Pressure Classification:**
-| smOBI | Pressure |
-|-------|----------|
-| > 0.3 | `buyer` |
-| < -0.3 | `seller` |
-| else | `neutral` |
-
-**Query Interface:**
+**Update Algorithm:**
 ```q
-/ Single symbol
-.rte.getImbalance[`BTCUSDT]
-
-/ All symbols with pressure
-.rte.getImbalanceAll[]
-
-/ Returns:
-sym     OBI    smOBI  pressure
-------------------------------
-BTCUSDT 0.15   0.22   neutral
-ETHUSDT 0.45   0.38   buyer
-SOLUSDT -0.32  -0.28  neutral
-
-/ History for charting
-.rte.getOBIHistory[`BTCUSDT; 5]  / Last 5 minutes
-```
-
----
-
-### 5. L2 Order Book State
-
-**Purpose:** Maintain latest L2 snapshot for dashboard display.
-
-**Storage Strategy: Raw List (Hot Path Optimized)**
-
-The order book is stored as a **raw list** for minimal update overhead:
-```q
-.rte.book.latest[`BTCUSDT]
-/ Indices 0-4:   bidPrice1-5
-/ Indices 5-9:   bidQty1-5
-/ Indices 10-14: askPrice1-5
-/ Indices 15-19: askQty1-5
-/ Index 20:      time
-```
-
-**Update (Hot Path):**
-```q
-.rte.book.update:{[s;data;time]
-  .rte.book.latest[s]:data[2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21],time;
+.rte.updOBI:{[s;bidDepth;askDepth;time]
+  total:bidDepth + askDepth;
+  rawOBI:$[total > 0f; (bidDepth - askDepth) % total; 0n];
+  prevSmooth:$[s in key .rte.st.obi; .rte.st.obi[s;1]; rawOBI];
+  smoothOBI:(.rte.cfg.obiAlpha * rawOBI) + ((1 - .rte.cfg.obiAlpha) * prevSmooth);
+  .rte.st.obi[s]:(rawOBI; smoothOBI; time);
   };
 ```
 
-**Query (Cold Path - Formatted for Display):**
+**Query Interface:**
 ```q
-.rte.getOrderBook[`BTCUSDT]
-
-/ Returns table:
-bidQty   bidPrice  askPrice  askQty
------------------------------------
-0.5      90700     90701     0.3
-1.2      90699     90702     0.8
-...
-
-.rte.getSpread[`BTCUSDT]
+.rte.getOBI[`smooth]    / Smooth OBI only
+.rte.getOBI[`raw]       / Raw OBI only
+.rte.getOBIAll[]        / Both
 
 / Returns:
-spread | 1
-mid    | 90700.5
-bestBid| 90700
-bestAsk| 90701
-time   | ...
+sym     rawOBI  smoothOBI
+-------------------------
+BTCUSDT 0.123   0.087
+SOLUSDT -0.045  -0.032
+ETHUSDT 0.234   0.156
 ```
 
----
-
-## Dashboard Query Functions
-
-The RTE provides specialized query functions optimized for KX Dashboard consumption:
-
-### Symbol Summary Table
-```q
-/ Get summary for all symbols with VWAP trend
-.rte.getSummary[1;5]  / 1-min vs 5-min VWAP
-
-/ Returns:
-sym     lastPrice  vwapShort  vwapLong   trend
-----------------------------------------------
-BTCUSDT 94521.00   94518.50   94502.30   up
-ETHUSDT 3321.50    3320.80    3318.40    up
-SOLUSDT 185.20     185.10     185.50     down
-```
-
-### Volatility Comparison Table
-```q
-/ Compare annualized vol to implied vol
-.rte.getVolComparison[]
-
-/ Returns:
-sym     annualizedVol impliedVol vsIVol
----------------------------------------
-BTCUSDT 8.41          45.00      below
-ETHUSDT 11.68         65.00      below
-SOLUSDT 31.69         67.00      below
-```
-
-**Configuration for implied volatility:**
-```q
-.rte.cfg.iVol:`BTCUSDT`ETHUSDT`SOLUSDT!45.00 65.00 67.00;  / 30-day IV (%)
-```
+**Interpretation:**
+- OBI > 0: More bid depth (buying pressure)
+- OBI < 0: More ask depth (selling pressure)
+- Smooth OBI filters noise for trading signals
 
 ---
 
 ## State Schema Summary
 
-| State | Type | Memory | Update | Cleanup |
-|-------|------|--------|--------|---------|
-| tradeBuckets | Keyed table | ~400KB (65min × 3sym) | O(1) upsert | Timer (5s) |
-| .rte.imb.latest | Dictionary | ~300 bytes | O(1) | None |
-| .rte.imb.ema | Dictionary | ~100 bytes | O(1) | None |
-| .rte.imb.history | Table | ~2MB (7min) | O(1) append | Timer (5s) |
-| .rte.book.latest | Dictionary | ~500 bytes | O(1) | None |
-| .rte.vcov.latest | Dictionary | ~1KB | Timer (5s) | None |
-| .rte.vcov.history | Table | ~50KB (15min) | Timer (5s) | Timer (5s) |
+| State | Type | Memory | Update |
+|-------|------|--------|--------|
+| .rte.st.vwap | Dictionary | ~300 bytes | O(1) |
+| .rte.st.volPrices | Dictionary | ~50KB (10min) | O(1) |
+| .rte.st.volReturns | Dictionary | ~10KB | O(1) |
+| .rte.st.volLatest | Dictionary | ~100 bytes | O(1) |
+| .rte.st.book | Dictionary | ~500 bytes | O(1) |
+| .rte.st.obi | Dictionary | ~100 bytes | O(1) |
+
+**Total:** ~60KB (scales linearly with symbols)
 
 ---
 
 ## Query Interface Summary
 
-**VWAP:**
 ```q
-.rte.getVwap[`BTCUSDT; 5]              / 5-minute VWAP
-.rte.getSummary[1; 5]                  / All symbols with VWAP trend
-```
-
-**Order Book:**
-```q
-.rte.getOrderBook[`BTCUSDT]            / L2 order book table
-.rte.getSpread[`BTCUSDT]               / Spread and mid-price
-.rte.getImbalance[`BTCUSDT]            / Order book imbalance (single symbol)
-.rte.getImbalanceAll[]                 / All symbols with pressure
-.rte.getOBIHistory[`BTCUSDT; 5]        / OBI history for charting
-```
-
-**Variance-Covariance:**
-```q
-.rte.getVarCovar[60]                   / Calculate fresh matrix
-.rte.getVcov[]                         / Latest matrix (from timer)
-.rte.getCorrelation[]                  / Correlation matrix (dict)
-.rte.getCorrelationTable[]             / Correlation matrix (table for dashboard)
-.rte.getAnnualizedVol[]                / Annualized volatility
-.rte.getVolComparison[]                / Vol vs implied vol
-.rte.getVcovHistory[`BTCUSDT;`ETHUSDT;15]  / Covariance history
-```
-
----
-
-## Timer Functions
-
-The RTE timer runs every 5 seconds:
-
-```q
-.z.ts:{[]
-  .rte.bucket.cleanup[];      / Remove old trade buckets (> 65 min)
-  .rte.vcov.update[];         / Recalculate var-covar matrix
-  .rte.vcov.cleanup[];        / Remove old vcov history (> 15 min)
-  .rte.imb.cleanup[];         / Remove old OBI history (> 7 min)
-  };
+.health[]                / Standardized health check (process, port, uptime, status, memory)
+.rte.getVwap[]           / VWAP all symbols
+.rte.getVol[]            / Daily vol (annualized %)
+.rte.getOrderBook[`SYM]  / L5 order book
+.rte.getSpread[`SYM]     / Bid/ask/spread/mid
+.rte.getOBI[`smooth]     / Smooth OBI
+.rte.getOBI[`raw]        / Raw OBI
+.rte.getOBIAll[]         / Both raw and smooth OBI
+.rte.replay[.z.D]        / Replay today's log
 ```
 
 ---
@@ -480,115 +304,71 @@ On RTE restart:
 | Step | Action |
 |------|--------|
 | 1 | Replay today's TP log file (if exists) |
-| 2 | Connect and subscribe to tickerplant for live updates |
-| 3 | Apply cleanup to remove data outside retention windows |
-| 4 | Analytics become valid as data accumulates |
+| 2 | Connect and subscribe to Chained TP for batched updates |
+| 3 | Analytics become valid as data accumulates |
 
 **Warm-up Times:**
-- VWAP: ~5 minutes for valid 5-min calculation
-- Imbalance: Instant (first quote makes it valid)
+- VWAP: Instant (first trade makes it valid)
+- Daily Vol: ~15 minutes (need 30 returns)
 - Order Book: Instant (first quote makes it valid)
-- Var-Covar: ~50 minutes for valid 1-hour calculation
-
----
-
-## Performance Characteristics
-
-### Hot Path (Per-Trade/Quote)
-
-| Operation | Latency | Notes |
-|-----------|---------|-------|
-| Trade bucket upsert | <1μs | O(1) keyed upsert |
-| Order book update | <1μs | Raw list assignment |
-| Imbalance + EMA update | <1μs | Dictionary + arithmetic |
-| OBI history append | <1μs | Table append |
-
-### Cold Path (Query/Timer)
-
-| Operation | Latency | Notes |
-|-----------|---------|-------|
-| VWAP query (5min) | <100μs | Sum ~300 buckets |
-| Order book query | <10μs | Format list to table |
-| Var-covar calculation | <10ms | 120 buckets × 3 symbols |
-| Correlation derivation | <1ms | Matrix operations |
-| OBI history query | <1ms | Filter ~3000 rows |
-
-### Memory (3 symbols)
-
-| Component | Memory | Notes |
-|-----------|--------|-------|
-| Trade buckets | ~400KB | 65min × 60sec × 3sym × ~100 bytes |
-| OBI history | ~2MB | 7min of quote imbalances |
-| Vcov history | ~50KB | 15min of matrix snapshots |
-| Snapshots | ~2KB | Order book, imbalance latest |
-| **Total** | **~3MB** | Scales linearly with symbols |
+- OBI: Instant (first quote makes it valid)
 
 ---
 
 ## Rationale
 
-### Trade Buckets (Shared State):
-- **Reuse**: One storage serves both VWAP and var-covar
-- **Flexibility**: Different window sizes for different analytics
-- **Efficiency**: O(1) insert, O(buckets) query
+### Simplified Analytics:
+- Dashboard use case doesn't need complex var-covar
+- VWAP, Vol, Order Book, OBI cover core needs
+- Simpler implementation, easier to maintain
 
-### VWAP Bucketing:
-- **Production-grade**: Industry-standard approach
-- **Memory efficient**: 100x reduction vs. per-trade storage
-- **Fast queries**: O(buckets) not O(trades)
+### Batched Subscription (via Chained TP):
+- 5-second delay acceptable for dashboard display
+- Reduces load on primary TP hot path
+- Hot path reserved for WDB (persistence) and MLE (signal generation)
 
-### OBI EMA Smoothing:
-- **Noise reduction**: Raw OBI too volatile for trading signals
-- **Configurable**: Alpha adjusts responsiveness vs stability
-- **Pressure indicator**: Clear buyer/seller classification
+### Daily VWAP:
+- Cumulative is simpler than windowed
+- Resets at EOD
+- Standard market metric
 
-### Var-Covar Resampling:
-- **Meaningful returns**: 30-sec vs noisy 1-sec
-- **Stable statistics**: 120 data points per calculation
-- **Cold path**: Expensive calculation runs on timer, not per-trade
+### 30-Second Return Window for Vol:
+- Short enough to capture intraday volatility
+- Long enough to avoid noise
+- Standard approach for HF volatility estimation
 
-### Order Book Raw List:
-- **Hot path optimized**: Single vector slice on update
-- **Cold path formatting**: Table created only when queried
-
-### Latency Tracking Moved to Telemetry:
-- **Separation of concerns**: Analytics vs monitoring
-- **RTE focused**: Core analytics only
-- **See ADR-005**: Telemetry handles latency
+### EMA Smoothing for OBI:
+- Raw OBI too noisy for trading signals
+- Alpha=0.05 provides good smoothing
+- Both raw and smooth available
 
 ---
 
 ## Alternatives Considered
 
-### 1. Separate VWAP and var-covar buckets
+### 1. Tick-by-tick subscription (from primary TP)
 Rejected:
-- Redundant storage
-- More complex cleanup
-- Trade buckets serve both well
+- Adds load to primary TP
+- Not needed for dashboard use case
+- Batched is sufficient
 
-### 2. Real-time var-covar (per-trade)
-Rejected:
-- Too expensive for hot path
-- 1-sec returns are noisy anyway
-- Timer-based is sufficient
+### 2. Var-covar matrix
+Removed (2026-01-17):
+- Complex implementation
+- Not needed for current dashboard
+- Can be added later if needed
 
-### 3. Store formatted order book tables
-Rejected:
-- Wastes allocation on hot path
-- Raw list is faster to update
-- Formatting can be deferred to query
+### 3. Windowed VWAP (rolling 5-min, etc.)
+Simplified:
+- Daily cumulative is simpler
+- Meets current requirements
+- Can add windowed later if needed
 
-### 4. Single bucket size for all analytics
+### 4. Real-time volatility (per-trade)
 Rejected:
-- VWAP needs precision (1-sec)
-- Var-covar needs stability (30-sec)
-- Resample at query time is better
-
-### 5. Store raw OBI without smoothing
-Rejected:
-- Too noisy for trading signals
-- EMA provides cleaner indicator
-- History still stores both raw and smoothed
+- Too noisy
+- 30-second returns are more stable
+- Batched updates are sufficient
 
 ---
 
@@ -596,22 +376,19 @@ Rejected:
 
 ### Positive
 
-- Production-grade VWAP implementation
-- Cross-asset correlation analysis (var-covar)
-- Smoothed OBI with pressure indicator
-- OBI history for trend analysis
-- L2 order book for dashboard
-- Dashboard-optimized query functions
-- Efficient memory usage (~3MB total)
-- Hot path optimized (<1μs updates)
-- Clear validity indicators
+- Simple, focused analytics
+- Low memory footprint (~60KB)
+- Fast updates (O(1) per row)
+- Clear query interface
+- Batched subscription reduces primary TP load
+- Dashboard-ready output
 
 ### Negative / Trade-offs
 
-- VWAP state must rebuild after restart (~5 minutes)
-- Var-covar needs warm-up (~50 minutes for valid)
-- OBI history limited to 7 minutes
-- Bucketing introduces slight precision loss
+- 1-second delay from batching
+- Daily VWAP resets at EOD (no rolling window)
+- Vol needs warm-up (~15 minutes)
+- No var-covar matrix (simplified out)
 
 ---
 
@@ -619,19 +396,17 @@ Rejected:
 
 | Enhancement | Trigger |
 |-------------|---------|
-| Annualized var-covar storage | Portfolio risk dashboard |
-| Configurable OBI alpha per symbol | Different volatility profiles |
-| Configurable vcov window | Different consumer needs |
+| Rolling VWAP windows | Trading strategy needs |
+| Var-covar matrix | Portfolio risk dashboard |
 | More symbols | Scale to 100+ instruments |
-| OHLC bars | Charting requirements |
+| Tick-by-tick mode | Latency-sensitive use case |
 
 ---
 
 ## Links / References
 
 - `adr-001-timestamps-and-latency-measurement.md` (latency targets)
-- `adr-002-feed-handler-to-kdb-ingestion-path.md` (tick-by-tick precedent)
-- `adr-003-tickerplant-logging-and-durability-strategy.md` (ephemeral stance)
-- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (latency tracking moved here)
+- `adr-002-feed-handler-to-kdb-ingestion-path.md` (data flow)
+- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (TEL handles latency)
 - `adr-007-visualisation-and-consumption-strategy.md` (dashboard consumption)
 - `adr-009-Order-Book-Architecture.md` (quote feed handler details)

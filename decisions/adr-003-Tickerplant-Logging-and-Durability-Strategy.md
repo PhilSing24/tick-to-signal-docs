@@ -1,18 +1,18 @@
 # ADR-003: Tickerplant Logging and Durability Strategy
 
 ## Status
-Accepted (Updated 2026-01-16)
+Accepted (Updated 2026-01-17)
 
 ## Date
 Original: 2025-12-17
-Updated: 2025-12-29, 2026-01-06, 2026-01-09, 2026-01-16
+Updated: 2025-12-29, 2026-01-06, 2026-01-09, 2026-01-16, 2026-01-17
 
 ## Context
 
 In a canonical kdb real-time architecture, the tickerplant (TP) is responsible for:
 
 - Sequencing inbound events
-- Publishing updates to subscribers (WDB, RTE, MLE)
+- Publishing updates to subscribers (WDB, MLE, CTP)
 - Optionally providing a durability boundary via logging
 
 This project ingests real-time Binance market data:
@@ -26,10 +26,12 @@ A key design decision is whether and how the tickerplant should log incoming upd
 
 | Acronym | Definition |
 |---------|------------|
+| CTP | Chained Tickerplant (batched publisher) |
 | FH | Feed Handler |
 | HDB | Historical Database |
 | IPC | Inter-Process Communication |
 | MLE | Machine Learning Engine |
+| RDB | Real-time Database (query-only) |
 | RTE | Real-Time Engine |
 | TEL | Telemetry Process |
 | TP | Tickerplant |
@@ -88,7 +90,7 @@ The `health_feed_handler` table is **not logged** because:
 **Health data flow:**
 ```
 Trade FH ───┐
-            ├──► TP ──► TEL (subscription only, no logging)
+            ├──► TP ──► CTP ──► TEL (subscription only, no logging)
 Quote FH ───┘
 ```
 
@@ -114,20 +116,29 @@ Quote FH ───┘
 | Component | On Restart | Recovery Source |
 |-----------|------------|-----------------|
 | WDB | Starts empty | Replay from log |
-| RTE | State lost | Replay from log (then cleanup) |
 | MLE | State lost | Replay from log |
-| TEL | State lost | Rebuilds from subscriptions + queries |
+| CTP | Starts empty | N/A (no state) |
+| RTE | State lost | Subscribes to CTP, rebuilds |
+| TEL | State lost | Subscribes to CTP, rebuilds |
+| RDB | Starts empty | Subscribes to CTP, rebuilds |
 | TP | Logs reset | N/A |
+
+### Gap Detection
+
+The TP validates `fhSeqNo` for trade messages to detect IPC-level data loss:
+- Counters: `.tp.gaps.trade`, `.tp.missed.trade`, `.tp.restarts.trade`
+- Query via `.tp.status[]`
+- Quote gap detection is deferred (high message rate causes false positives)
 
 ### Tables and Logging
 
 | Table | Logged? | Subscribers |
 |-------|---------|-------------|
-| `trade_binance` | ✅ Yes | WDB, RTE, MLE |
-| `quote_binance` | ✅ Yes | WDB, RTE |
-| `health_feed_handler` | ❌ No (ephemeral) | TEL |
+| `trade_binance` | ✅ Yes | WDB, MLE, CTP |
+| `quote_binance` | ✅ Yes | WDB, CTP |
+| `health_feed_handler` | ❌ No (ephemeral) | CTP → TEL |
 
-**Note:** WDB and RTE subscribe to both trades and quotes. MLE subscribes to trades only.
+**Note:** WDB and CTP subscribe to both trades and quotes. MLE subscribes to trades only.
 
 ## Rationale
 
@@ -205,7 +216,7 @@ q
 .wdb.replay[2025.12.29]
 ```
 
-**Note:** RTE and MLE also auto-replay on startup, then run cleanup to keep only the retention window.
+**Note:** MLE also auto-replays on startup, then runs cleanup to keep only the retention window.
 
 ## Links / References
 

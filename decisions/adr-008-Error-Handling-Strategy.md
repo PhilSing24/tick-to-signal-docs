@@ -1,11 +1,11 @@
 # ADR-008: Error Handling Strategy
 
 ## Status
-Accepted (Updated 2026-01-16)
+Accepted (Updated 2026-01-18)
 
 ## Date
 Original: 2025-12-18
-Updated: 2026-01-03, 2026-01-06, 2026-01-11, 2026-01-14, 2026-01-16
+Updated: 2026-01-03, 2026-01-06, 2026-01-11, 2026-01-14, 2026-01-16, 2026-01-17, 2026-01-18
 
 ## Context
 
@@ -13,10 +13,12 @@ The system consists of multiple components communicating via network:
 
 ```
 Binance Trade Stream ──WebSocket──► Trade FH ──┬──IPC──► TP ──IPC──► WDB
-                                               │              ──IPC──► RTE
-Binance Depth Stream ──WebSocket──► Quote FH ──┘              ──IPC──► MLE
-         ▲                                                    ──IPC──► TEL
-         └──REST── (snapshot)                          queries ────┴──► WDB, RTE
+                                               │              ──IPC──► MLE
+Binance Depth Stream ──WebSocket──► Quote FH ──┘              ──IPC──► CTP
+         ▲                                                           │
+         └──REST── (snapshot)                           ┌────────────┤
+                                                        ▼            ▼
+                                                       RTE   TEL    RDB
 ```
 
 Each component can experience failures:
@@ -26,15 +28,12 @@ Each component can experience failures:
 | Trade FH | WebSocket disconnect, JSON parse error, IPC failure |
 | Quote FH | WebSocket disconnect, REST failure, sequence gap, IPC failure |
 | Tickerplant | Subscriber disconnect, invalid message, publish failure |
-| WDB | TP connection loss, timer error, query error |
-| RTE | TP connection loss, computation error |
+| WDB | TP connection loss, timer error, HDB write error |
 | MLE | TP connection loss, computation error |
-| TEL | TP connection loss, query error, timer error |
-
-The project is explicitly exploratory (ADR-003, ADR-006):
-- TP logging provides durability
-- Auto-replay provides recovery
-- Focus is on understanding real-time behaviour
+| CTP | TP connection loss, subscriber disconnect |
+| RTE | CTP connection loss, computation error |
+| TEL | CTP connection loss, computation error |
+| RDB | CTP connection loss, query error |
 
 A decision is required on how errors are handled across the system.
 
@@ -42,10 +41,12 @@ A decision is required on how errors are handled across the system.
 
 | Acronym | Definition |
 |---------|------------|
+| CTP | Chained Tickerplant (batched publisher) |
 | FH | Feed Handler |
 | IPC | Inter-Process Communication |
 | L2 | Level 2 market depth (5 price levels per side) |
 | MLE | Machine Learning Engine |
+| RDB | Real-time Database (query-only) |
 | RTE | Real-Time Engine |
 | TEL | Telemetry Process |
 | TP | Tickerplant |
@@ -61,32 +62,112 @@ The system adopts a **fail-fast with structured logging** error handling strateg
 |-----------|-----------|
 | Fail fast | Surface problems immediately; don't hide failures |
 | Log clearly | Make failures visible and diagnosable |
-| Retry strategically | TP/Binance reconnect with backoff; don't retry silently elsewhere |
+| Retry strategically | Exponential backoff for all connections |
 | Independent restart | Each process can be restarted without affecting others |
-| Structured logging | Use spdlog for consistent, leveled, timestamped logging |
+| Structured logging | Use spdlog (C++) and standard q logging for consistent output |
+| Graceful degradation | Continue in degraded mode when upstream unavailable |
 
-### Restart vs Reconnection
+### Connection Resilience Pattern
 
-These are distinct concepts:
+All kdb+ processes implement resilient connection handling with exponential backoff:
 
-| Concept | Meaning | Status |
-|---------|---------|--------|
-| **Independent restart** | Can restart one process without restarting others | ✓ Supported |
-| **Auto-reconnection (FH→Binance)** | Feed handler reconnects to Binance WebSocket | ✓ Implemented |
-| **Auto-reconnection (FH→TP)** | Feed handler reconnects to TP | ✓ Implemented |
-| **Auto-reconnection (q→TP)** | kdb+ processes reconnect to TP subscription | Manual restart required |
-| **Auto-reconnection (TEL→WDB/RTE)** | TEL query handles reconnect on failure | ✓ Implemented (ADR-005) |
+**State tracking:**
+```q
+.proc.conn.handle:0N;                    / Connection handle
+.proc.conn.state:`disconnected;          / disconnected, connecting, connected
+.proc.conn.lastAttempt:0Np;              / Time of last connection attempt
+.proc.conn.retryCount:0;                 / Failed attempts counter
+```
 
-Independent restart is a benefit of the separate-process architecture (ADR-002). Auto-reconnection in feed handlers is implemented with exponential backoff. TEL maintains persistent IPC handles to WDB/RTE that automatically reconnect on query failure (see ADR-005).
+**Backoff configuration:**
+```q
+.proc.conn.cfg.baseDelayMs:1000;         / 1 second initial delay
+.proc.conn.cfg.maxDelayMs:30000;         / 30 second maximum delay
+.proc.conn.cfg.backoffMultiplier:1.5;    / 1.5x multiplier per retry
+```
+
+**Backoff calculation:**
+```q
+.proc.conn.getBackoffMs:{[]
+  delay:.proc.conn.cfg.baseDelayMs * prd .proc.conn.retryCount#.proc.conn.cfg.backoffMultiplier;
+  .proc.conn.cfg.maxDelayMs & `long$delay
+  };
+```
+
+**Connection function (never throws):**
+```q
+.proc.connect:{[]
+  if[not null .proc.conn.handle; :1b];              / Already connected
+  if[not .proc.canRetry[]; :0b];                    / Backoff not elapsed
+  
+  .proc.conn.state:`connecting;
+  .proc.conn.lastAttempt:.z.p;
+  
+  h:@[hopen; `$"::",string[port]; {-1 "Connection failed: ",x; 0N}];
+  
+  if[null h;
+    .proc.conn.retryCount+:1;
+    .proc.conn.state:`disconnected;
+    -1 "Will retry in ",string[.proc.conn.getBackoffMs[]],"ms";
+    :0b
+  ];
+  
+  / Subscribe to upstream...
+  .proc.conn.handle:h;
+  .proc.conn.state:`connected;
+  .proc.conn.retryCount:0;
+  1b
+  };
+```
+
+**Disconnect handler:**
+```q
+.z.pc:{[h]
+  if[h = .proc.conn.handle;
+    -1 "Upstream disconnected";
+    .proc.conn.handle:0N;
+    .proc.conn.state:`disconnected;
+    .proc.conn.retryCount:0;    / Reset for fresh backoff sequence
+  ];
+  };
+```
+
+**Timer-based reconnection:**
+```q
+.z.ts:{[]
+  if[null .proc.conn.handle; .proc.connect[]];
+  / ... other timer logic ...
+  };
+```
+
+### Standardized Health Check
+
+All kdb+ processes implement a consistent `.health[]` function:
+
+```q
+.health:{[]
+  st:$[.proc.conn.state = `connected; `ok;
+       .proc.conn.state = `connecting; `degraded;
+       `disconnected];
+  
+  `process`port`uptime`status`connState`retryCount`memMB!(
+    `procname;
+    .proc.cfg.port;
+    `second$.z.p - .proc.startTime;
+    st;
+    .proc.conn.state;
+    .proc.conn.retryCount;
+    (`long$.Q.w[][`used]) % 1000000
+  )
+  };
+```
 
 ### Error Categories
-
-Errors are categorised by severity and response:
 
 | Category | Examples | Response |
 |----------|----------|----------|
 | **Fatal** | Cannot load config, port unavailable | Log and exit |
-| **Connection** | Lost connection to peer | Log and attempt reconnect with backoff |
+| **Connection** | Lost connection to peer | Log, enter degraded mode, retry with backoff |
 | **Transient** | Parse error, invalid message | Log and skip message |
 | **Recoverable** | Sequence gap, book invalid | Log, enter recovery state |
 | **Silent** | Expected disconnects | Handle gracefully (no error log) |
@@ -95,256 +176,72 @@ Errors are categorised by severity and response:
 
 #### Trade Feed Handler (C++)
 
-**Implementation:** `cpp/src/trade_feed_handler.cpp`
-
-| Error | Category | Handling | Implementation |
-|-------|----------|----------|----------------|
-| Cannot load config | Fatal | Log, exit with code 1 | `config.load()` returns false |
-| No symbols configured | Fatal | Log, exit with code 1 | Check `config.symbols.empty()` |
-| Cannot connect to Binance | Connection | Log, retry with exponential backoff | `runWebSocketLoop()` try/catch |
-| Cannot connect to TP | Connection | Log, retry with exponential backoff | `connectToTP()` loop with backoff |
-| WebSocket disconnect (Binance) | Connection | Log, reconnect with backoff | Exception in `runWebSocketLoop()` |
-| TP connection lost | Connection | Log, reconnect to TP | IPC returns nullptr, call `connectToTP()` |
-| JSON parse error | Transient | Log warning, skip message | `doc.Parse()` check, continue |
-| Missing required field | Transient | Log warning, skip message | `HasMember()` checks, early return |
-| TradeId gap detected | Transient | Log warning, continue | `validateTradeId()` logs, continues |
-| IPC send failure | Connection | Log, reconnect TP | Result nullptr triggers reconnect |
-
-**Reconnection backoff (Binance):**
-```cpp
-int delay = INITIAL_BACKOFF_MS;  // 1000ms
-for (int i = 0; i < attempt && delay < MAX_BACKOFF_MS; ++i) {
-    delay *= BACKOFF_MULTIPLIER;  // 2x
-}
-delay = std::min(delay, MAX_BACKOFF_MS);  // Cap at 8000ms
-```
-
-**Note:** Binance recommends a maximum backoff of 30 seconds (see `api-binance.md`). This implementation uses 8 seconds for faster recovery during development, which is acceptable for an exploratory project with low connection volume (3 symbols, single instance). Production systems at scale should consider the longer backoff to avoid rate limiting during widespread outages.
-
-**Sequence validation:**
-```cpp
-void TradeFeedHandler::validateTradeId(const std::string& sym, long long tradeId) {
-    auto it = lastTradeId_.find(sym);
-    if (it != lastTradeId_.end()) {
-        long long last = it->second;
-        if (tradeId < last) {
-            spdlog::warn("OUT OF ORDER: {} last={} got={}", sym, last, tradeId);
-        } else if (tradeId == last) {
-            spdlog::warn("DUPLICATE: {} tradeId={}", sym, tradeId);
-        } else if (tradeId > last + 1) {
-            long long missed = tradeId - last - 1;
-            spdlog::warn("Gap: {} missed={} (last={} got={})", sym, missed, last, tradeId);
-        }
-    }
-    lastTradeId_[sym] = tradeId;
-}
-```
-
-**Signal handling:**
-```cpp
-static void signalHandler(int signum) {
-    spdlog::info("Received {} ({})", sigName, signum);
-    if (g_handler) {
-        g_handler->stop();  // Thread-safe atomic flag
-    }
-}
-```
+| Error | Category | Handling |
+|-------|----------|----------|
+| Cannot load config | Fatal | Log, exit with code 1 |
+| No symbols configured | Fatal | Log, exit with code 1 |
+| Cannot connect to Binance | Connection | Log, retry with exponential backoff |
+| Cannot connect to TP | Connection | Log, retry with exponential backoff |
+| WebSocket disconnect | Connection | Log, reconnect with backoff |
+| TP connection lost | Connection | Log, reconnect to TP |
+| JSON parse error | Transient | Log warning, skip message |
+| Missing required field | Transient | Log warning, skip message |
 
 #### Quote Feed Handler (C++)
 
-**Implementation:** `cpp/src/quote_feed_handler.cpp`
-
-| Error | Category | Handling | Implementation |
-|-------|----------|----------|----------------|
-| Cannot load config | Fatal | Log, exit with code 1 | `config.load()` returns false |
-| Cannot connect to Binance | Connection | Log, retry with backoff | Same as trade FH |
-| Cannot connect to TP | Connection | Log, retry with backoff | Same as trade FH |
-| WebSocket disconnect (Binance) | Connection | Log, reconnect, books reset | Exception triggers reconnect |
-| TP connection lost | Connection | Log, reconnect to TP | IPC returns nullptr |
-| REST snapshot failure | Recoverable | Log, retry with backoff | `restClient_.fetchSnapshot()` error |
-| Sequence gap detected | Recoverable | Log, transition to INVALID, re-sync | `OrderBookManager` state machine |
-| Book in INVALID state | Recoverable | Publish invalid L2 quote, attempt re-sync | `publishInvalid()` called |
-| JSON parse error | Transient | Log warning, skip message | Early return on parse error |
-| IPC send failure | Connection | Log, reconnect TP | Result nullptr triggers reconnect |
-
-**Quote handler state transitions on error:**
-
-```
-VALID ──sequence gap──► INVALID ──re-sync──► SYNCING ──► VALID
-                            │
-                            └──publish invalid L2 quote (isValid=0b)
-```
-
-**OrderBookManager state tracking:**
-```cpp
-enum class BookState {
-    INIT,      // No data, buffering deltas
-    SYNCING,   // Snapshot received, applying buffered deltas
-    VALID,     // Book consistent, publishing L2
-    INVALID    // Sequence gap detected
-};
-```
-
-**Error logging in snapshot fetch:**
-```cpp
-SnapshotData snapshot = restClient_.fetchSnapshot(sym, SNAPSHOT_DEPTH);
-if (!snapshot.success) {
-    spdlog::error("Snapshot failed for {}: {}", sym, snapshot.error);
-    bookMgr_->invalidate(symIdx, "Snapshot fetch failed");
-    return;
-}
-```
+| Error | Category | Handling |
+|-------|----------|----------|
+| Cannot load config | Fatal | Log, exit with code 1 |
+| Cannot connect to Binance | Connection | Log, retry with backoff |
+| Cannot connect to TP | Connection | Log, retry with backoff |
+| WebSocket disconnect | Connection | Log, reconnect, books reset |
+| REST snapshot failure | Recoverable | Log, retry with backoff |
+| Sequence gap detected | Recoverable | Log, transition to INVALID, re-sync |
+| Book in INVALID state | Recoverable | Publish invalid L2 quote (isValid=0b) |
 
 #### Tickerplant (q)
 
-**Implementation:** `kdb/tp.q`
-
-| Error | Category | Handling | Implementation |
-|-------|----------|----------|----------------|
-| Port already in use | Fatal | Log, exit | `\p` fails, q exits |
-| Invalid table name | Transient | Signal error to caller | `.u.upd` type check |
-| Subscriber disconnect | Silent | Remove from `.u.w` via `.z.pc` | Handled automatically |
-| Publish to dead handle | Transient | Caught by `.z.pc`, handle removed | Automatic cleanup |
-| Malformed message | Transient | Let q signal error (logged to console) | q error handling |
-| Log write failure | Transient | Log error, continue publishing | `@[...]` wrapper |
-
-**Subscriber disconnect handling:**
-```q
-/ Handle subscriber disconnect gracefully
-.z.pc:{[h]
-  .u.w:{x except h} each .u.w;
-  -1 "Subscriber disconnected: handle ",string h;
-  };
-```
+| Error | Category | Handling |
+|-------|----------|----------|
+| Port already in use | Fatal | Log, exit |
+| Invalid table name | Transient | Signal error to caller |
+| Subscriber disconnect | Silent | Remove from subscribers via `.z.pc` |
+| Log write failure | Transient | Log error, continue publishing |
 
 #### WDB (q)
 
-**Implementation:** `kdb/wdb.q`
-
-| Error | Category | Handling | Implementation |
-|-------|----------|----------|----------------|
-| Cannot connect to TP | Fatal | Log, exit | `hopen` fails, exit |
-| TP connection lost | Connection | Log, process continues (no auto-reconnect) | Connection dies, query fails |
-| Timer callback error | Transient | Log, continue (next timer fires) | Protected with `@[...]` |
-| Query error | Transient | Log, skip operation | Error caught, logged |
-| HDB write failure | Recoverable | Log, retry next flush | Protected write operation |
-
-**Protected TP connection:**
-```q
-.wdb.connect:{[]
-  h:@[hopen; `::5010; {-1 "Failed to connect to TP: ",x; 0N}];
-  if[null h; '"Cannot connect to tickerplant"];
-  / ... subscription ...
-  };
-```
-
-#### RTE (q)
-
-**Implementation:** `kdb/rte.q`
-
-| Error | Category | Handling | Implementation |
-|-------|----------|----------|----------------|
-| Cannot connect to TP | Fatal | Log, exit | `hopen` fails, exit |
-| TP connection lost | Connection | Log, process continues | Connection dies silently |
-| Unknown symbol | Silent | Initialize buffer automatically | Auto-create bucket structure |
-| Computation error | Transient | Log, analytics may be stale | Protected computation |
-
-**Auto-initialize unknown symbols:**
-```q
-/ VWAP add - auto-initialize if needed
-.rte.vwap.add:{[s;time;price;qty]
-  / Auto-initialize bucket if symbol not seen
-  if[not s in exec distinct sym from vwapBuckets;
-    -1 "Auto-initializing VWAP for ",string s;
-  ];
-  / ... add logic ...
-  };
-```
+| Error | Category | Handling |
+|-------|----------|----------|
+| Cannot connect to TP | Connection | Log, retry with exponential backoff |
+| TP connection lost | Connection | Log, retry on timer |
+| Timer callback error | Transient | Log, continue |
+| HDB write failure | Recoverable | Log, retry next flush |
+| Unexpected exit | Recoverable | Flush data to TMPSAVE (see ADR-006) |
 
 #### MLE (q)
 
-**Implementation:** `kdb/mle.q`
+| Error | Category | Handling |
+|-------|----------|----------|
+| Cannot connect to TP | Connection | Log, retry with exponential backoff |
+| TP connection lost | Connection | Log, retry on timer |
+| Bar computation error | Transient | Log, skip bar |
 
-| Error | Category | Handling | Implementation |
-|-------|----------|----------|----------------|
-| Cannot connect to TP | Fatal | Log, exit | `hopen` fails, exit |
-| TP connection lost | Connection | Log, process continues | Connection dies silently |
-| Unknown symbol | Silent | Initialize accumulators automatically | Auto-create state |
-| Bar computation error | Transient | Log, skip bar | Protected computation |
+#### CTP (q)
 
-#### TEL (q)
+| Error | Category | Handling |
+|-------|----------|----------|
+| Cannot connect to TP | Connection | Log, retry with exponential backoff |
+| TP connection lost | Connection | Log, retry on timer |
+| Subscriber disconnect | Silent | Remove via `.z.pc` |
 
-**Implementation:** `kdb/tel.q`
+#### RTE, TEL, RDB (q)
 
-| Error | Category | Handling | Implementation |
-|-------|----------|----------|----------------|
-| Cannot connect to TP | Fatal | Log, exit | `hopen` fails, exit |
-| TP connection lost | Connection | Log, process continues | Subscription lost |
-| Query error (WDB/RTE) | Transient | Log, mark handle invalid, retry next cycle | `.tel.safeQuery` with persistent handles |
-| Timer error | Transient | Log, skip bucket | Protected timer callback |
-
-**Persistent handle management (see ADR-005):**
-```q
-/ Handle dictionary: port -> handle (0N = not connected)
-.tel.h:(`int$())!`int$();
-
-/ Get or create persistent handle to a port
-/ Uses lazy connection - only connects when needed
-.tel.getH:{[p]
-  / Return existing valid handle
-  if[.tel.hasValidH[p]; :.tel.h[p]];
-  
-  / Attempt connection with error handling
-  h:@[hopen; `$"::",string p; {[port;err] 
-    -1 "TEL: Failed to connect to port ",string[port]," - ",err; 
-    0N
-    }[p]];
-  
-  / Store result (valid handle or 0N)
-  .tel.h[p]:h;
-  
-  / Log successful connection
-  if[not null h; -1 "TEL: Connected to port ",string[p]," (handle ",string[h],")"];
-  
-  h
-  };
-
-/ Safe query using persistent handles
-/ Automatically marks handle invalid on error for reconnection on next call
-.tel.safeQuery:{[port;query]
-  / Get or establish connection
-  h:.tel.getH[port];
-  if[null h; :()];
-  
-  / Execute query with error trapping
-  res:@[h; query; {[p;q;err] 
-    / Log the error with context
-    -1 "TEL: Query failed on port ",string[p]," - ",err;
-    / Mark handle as invalid for reconnection on next call
-    .tel.h[p]:0N;
-    `..tel.queryError
-    }[port;query]];
-  
-  / Return empty on error (sentinel value check)
-  if[res ~ `..tel.queryError; :()];
-  
-  res
-  };
-```
-
-### Logging Strategy
-
-**C++ Components (spdlog):**
-```cpp
-spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%s:%#] %v");
-spdlog::set_level(spdlog::level::info);
-```
-
-**kdb+ Components:**
-```q
-/ Standard logging pattern
--1 "COMPONENT: Message with context - ",string[value];
-```
+| Error | Category | Handling |
+|-------|----------|----------|
+| Cannot connect to CTP | Connection | Log, retry with exponential backoff |
+| CTP connection lost | Connection | Log, retry on timer |
+| Computation error | Transient | Log, skip |
+| Memory threshold (RDB) | Recoverable | Log warning, emergency cleanup |
 
 ### Graceful Shutdown
 
@@ -358,13 +255,30 @@ signal(SIGINT, signalHandler);
 
 **kdb+ (.z.exit):**
 ```q
-.z.exit:{
+.z.exit:{[x]
   -1 "Shutting down...";
-  / Cleanup logic
+  / Cleanup logic (e.g., WDB flushes to TMPSAVE)
   };
 ```
 
 **stop.sh:** Sends SIGTERM first, waits, then SIGKILL if needed.
+
+### Connection Resilience Summary
+
+| Process | Upstream | Resilient | Backoff |
+|---------|----------|-----------|---------|
+| WDB | TP:5010 | ✓ | Exponential |
+| MLE | TP:5010 | ✓ | Exponential |
+| CTP | TP:5010 | ✓ | Exponential |
+| RTE | CTP:5014 | ✓ | Exponential |
+| TEL | CTP:5014 | ✓ | Exponential |
+| RDB | CTP:5014 | ✓ | Exponential |
+
+All processes:
+- Start in degraded mode if upstream unavailable
+- Retry with exponential backoff
+- Resume normal operation when connection restored
+- Report connection state via `.health[]`
 
 ## Rationale
 
@@ -373,36 +287,11 @@ This approach was selected because:
 - **Fail-fast** surfaces problems immediately for debugging
 - **Structured logging** makes issues diagnosable
 - **Independent processes** allow partial restart
-- **Backoff retry** prevents thundering herd on reconnection
-- **Sequence validation** detects gaps without blocking
+- **Exponential backoff** prevents thundering herd and resource exhaustion
+- **Timer-based reconnection** is simple and effective
 - **State machine** handles book recovery systematically
-- **Persistent handles** minimize connection overhead
-
-## Alternatives Considered
-
-### 1. Silent retry loops
-Rejected:
-- Hides problems
-- Makes debugging difficult
-- Can cause resource exhaustion
-
-### 2. Auto-reconnection for all q processes
-Rejected:
-- Adds complexity
-- Manual restart is acceptable for exploratory project
-- Can be added later if needed
-
-### 3. Crash on any error
-Rejected:
-- Too aggressive for transient issues
-- Loses accumulated state
-- Poor developer experience
-
-### 4. External process supervisor
-Rejected for current phase:
-- Adds infrastructure complexity
-- Manual restart sufficient for exploration
-- Can be added for production
+- **Graceful degradation** allows processes to continue during transient failures
+- **Standardized health checks** provide consistent monitoring interface
 
 ## Consequences
 
@@ -411,15 +300,16 @@ Rejected for current phase:
 - Clear visibility into failures via logging
 - Independent process restart capability
 - Systematic book recovery on gaps
-- Graceful degradation (publish invalid, don't crash)
-- Feed handlers auto-reconnect to Binance and TP
-- TEL auto-reconnects to WDB/RTE on query failure
+- Graceful degradation (continue in degraded mode)
+- Auto-reconnection with exponential backoff throughout pipeline
+- Standardized `.health[]` for monitoring
+- WDB preserves data on unexpected exit
 
 ### Negative / Trade-offs
 
-- q processes don't auto-reconnect to TP (manual restart)
-- Some errors require operator intervention
 - Log volume can be high during issues
+- Some errors require operator intervention
+- Connection resilience adds complexity
 
 These trade-offs are acceptable for the current phase.
 
@@ -428,6 +318,5 @@ These trade-offs are acceptable for the current phase.
 - `adr-001-timestamps-and-latency-measurement.md` (sequence numbers)
 - `adr-002-feed-handler-to-kdb-ingestion-path.md` (connection architecture)
 - `adr-003-tickerplant-logging-and-durability-strategy.md` (logging durability)
-- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (TEL persistent handles)
-- `adr-006-recovery-and-replay-strategy.md` (replay on restart)
+- `adr-006-recovery-and-replay-strategy.md` (replay on restart, WDB safe exit)
 - `adr-009-order-book-architecture.md` (book state machine)

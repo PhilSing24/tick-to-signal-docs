@@ -1,11 +1,11 @@
 # ADR-002: Feed Handler to kdb Ingestion Path
 
 ## Status
-Accepted (Updated 2026-01-16)
+Accepted (Updated 2026-01-17)
 
 ## Date
 Original: 2025-12-17
-Updated: 2026-01-03, 2026-01-06, 2026-01-16
+Updated: 2026-01-03, 2026-01-06, 2026-01-16, 2026-01-17
 
 ## Context
 
@@ -31,12 +31,15 @@ This project is explicitly inspired by the *Building Real Time Event Driven KDB-
 
 | Acronym | Definition |
 |---------|------------|
+| CTP | Chained Tickerplant (batched publisher) |
 | FH | Feed Handler |
 | HDB | Historical Database |
 | IPC | Inter-Process Communication |
 | L2 |  Level 2 market depth (5 price levels per side) |
 | MLE | Machine Learning Engine |
+| RDB | Real-time Database (query-only, receives batched data) |
 | RTE | Real-Time Engine |
+| SIG | Signal Generator (future) |
 | TEL | Telemetry |
 | TP | Tickerplant |
 | WDB | Write-only Database (intraday writedown to HDB) |
@@ -48,11 +51,14 @@ Both feed handlers publish data **directly into a single Tickerplant via IPC**.
 ### Architecture
 
 ```
-Binance Trade Stream ──► Trade FH ──┬──► TP:5010 ──┬──► WDB:5012 (writes to HDB)
-                                    │              ├──► RTE:5013 (VWAP, vol, OBI)
-Binance Depth Stream ──► Quote FH ──┘              ├──► MLE:5015 (DIB/DRB bars, trades only)
-                                                   ├──► TEL:5014 (health monitoring)
-                                                   └──► Logs (both)
+Binance Trade Stream ──► Trade FH ──┬──► TP:5010 ──┬──► WDB:5011 (writes to HDB)
+                                    │              ├──► MLE:5012 (tick-by-tick)
+Binance Depth Stream ──► Quote FH ──┘              │
+                                                   └──► CTP:5014 (batched 1s)
+                                                             │
+                                                             ├──► RTE:5015 (dashboard)
+                                                             ├──► TEL:5016 (FH latency)
+                                                             └──► RDB:5017 (user queries)
 ```
 
 ### Feed Handler Design
@@ -115,10 +121,11 @@ The quote feed handler is **stateful** and maintains **L2 order book state**:
 - Each C++ feed handler connects to the running kdb tickerplant using the kdb+ C API
 - Normalised events are published as update messages to the tickerplant
 - The tickerplant remains the single ingress point for:
-  - Logging (separate files per data type, see ADR-003)
-  - Fan-out to subscribers (WDB, RTE, MLE, TEL)
+  - Logging (single combined log file, see ADR-003)
+  - Fan-out to subscribers (WDB, MLE, CTP)
   - Time-ordering and sequencing
   - Adding `tpRecvTimeUtcNs` timestamp
+  - Gap detection for trade sequence numbers
 
 ### IPC Mode
 
@@ -177,8 +184,8 @@ neg[h] (`.u.upd; `quote_binance; quoteData)
 
 | Table | Source | FH Fields | TP Adds | WDB Adds | Total | Subscribers |
 |-------|--------|-----------|---------|----------|-------|-------------|
-| `trade_binance` | Trade FH | 12 | 1 | 1 | 14 | WDB, RTE, MLE |
-| `quote_binance` | Quote FH | 28 | 1 | 1 | 30 | WDB, RTE |
+| `trade_binance` | Trade FH | 12 | 1 | 1 | 14 | WDB, MLE, CTP |
+| `quote_binance` | Quote FH | 28 | 1 | 1 | 30 | WDB, CTP |
 
 **Trade Schema (14 fields total)**:
 - **FH sends (12)**: `time`, `sym`, `tradeId`, `price`, `qty`, `buyerIsMaker`, `exchEventTimeMs`, `exchTradeTimeMs`, `fhRecvTimeUtcNs`, `fhParseUs`, `fhSendUs`, `fhSeqNo`
@@ -223,6 +230,7 @@ This option was selected because it:
   - Feed handlers: external I/O, parsing, normalisation, timestamp capture (ADR-001)
   - Tickerplant: sequencing, publication, logging (ADR-003)
   - WDB: intraday storage and HDB persistence
+  - CTP: batched publishing for dashboard/query subscribers
   - RTE: derived analytics (ADR-004)
   - MLE: information-driven bars (trades only)
 - Minimises end-to-end latency by avoiding intermediate persistence layers
@@ -335,6 +343,7 @@ Rejected because:
 - Per-event timing enables detailed latency analysis
 - Raw timing data available in WDB for debugging
 - Both handlers instrumented consistently
+- TP validates trade `fhSeqNo` for gap detection (quote gaps deferred)
 
 ### Negative / Trade-offs
 

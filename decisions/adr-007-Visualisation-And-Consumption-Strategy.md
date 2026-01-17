@@ -1,32 +1,23 @@
 # ADR-007: Visualisation and Consumption Strategy
 
 ## Status
-Accepted (Updated 2026-01-16)
+Accepted (Updated 2026-01-18)
 
 ## Date
-2025-12-17 (Updated 2025-12-19, 2026-01-14, 2026-01-16)
+2025-12-17 (Updated 2025-12-19, 2026-01-14, 2026-01-16, 2026-01-17, 2026-01-18)
 
 ## Context
 
 The system produces:
 - Real-time market data (Binance trades and quotes)
-- Derived analytics (VWAP, order book imbalance, variance-covariance)
+- Derived analytics (VWAP, daily vol, order book imbalance)
 - ML features (DIB, DRB bars, labels)
-- Telemetry and latency metrics
+- Telemetry metrics (FH latency)
 
 These outputs must be:
 - Observable by humans during development and operation
 - Suitable for validating system behaviour
 - Easy to iterate on during exploration
-
-Multiple visualisation approaches are possible:
-
-| Approach | Description |
-|----------|-------------|
-| Custom UI builds | Bespoke web or desktop application |
-| External BI tools | Grafana, Tableau, etc. |
-| Streaming dashboards | Push-based real-time updates |
-| KX Dashboards | Native KDB-X visualisation tooling |
 
 A decision is required on how system outputs are visualised and consumed.
 
@@ -34,9 +25,11 @@ A decision is required on how system outputs are visualised and consumed.
 
 | Acronym | Definition |
 |---------|------------|
+| CTP | Chained Tickerplant (batched publisher) |
 | FH | Feed Handler |
 | IPC | Inter-Process Communication |
 | MLE | Machine Learning Engine |
+| RDB | Real-time Database (query-only) |
 | RTE | Real-Time Engine |
 | TEL | Telemetry Process |
 | TP | Tickerplant |
@@ -66,177 +59,81 @@ The project will use **KX Dashboards** as the primary visualisation mechanism, w
 | Recovery handling | Automatic (next poll) | Must handle reconnect |
 | Update granularity | Poll interval | Per-event possible |
 
-Polling is appropriate because:
-- Simpler to implement
-- Sufficient for human-scale observation
-- Avoids premature optimisation
-- Aligns with exploratory project goals
-
-### Polling Frequency
-
-**1-second polling interval** is selected:
-
-| Frequency | Trade-off |
-|-----------|-----------|
-| 200ms | Minimum for human perception; highest load |
-| 500ms | Good responsiveness; moderate load |
-| **1 second** | **Balanced; acceptable responsiveness** |
-| 5 seconds | Low load; sluggish feel |
-
-Rationale:
-- Acceptable responsiveness for development use
-- Minimal query load on WDB/RTE/MLE/TEL
-- Note: TEL buckets are 5 seconds, so telemetry data updates every 5s regardless
-
 ### Query Targets
 
-Dashboards query **WDB, RTE, MLE, and TEL**:
+Dashboards query **RDB, RTE, MLE, and TEL**:
 
 ```
-              +---> WDB :5012 (raw trades, quotes)
-              |
-Dashboard ----+---> RTE :5013 (VWAP, imbalance, var-covar, analytics validity)
-              |
-              +---> MLE :5015 (DIB, DRB bars, labels)
-              |
-              +---> TEL :5014 (latency telemetry, FH health, system metrics)
+              +──► RDB:5017 (raw trades, quotes)
+              │
+Dashboard ────+──► RTE:5015 (VWAP, vol, OBI, order book)
+              │
+              +──► MLE:5012 (DIB, DRB bars, labels, positions)
+              │
+              +──► TEL:5016 (FH latency, FH health)
 ```
 
-| Data | Source | Port | Table/Query |
-|------|--------|------|-------------|
-| Last trade price | WDB | 5012 | `trade_binance` |
-| Raw trade history | WDB | 5012 | `trade_binance` |
-| L5 order book | RTE | 5013 | `.rte.getOrderBook[]` |
-| Rolling VWAP | RTE | 5013 | `.rte.getVwap[]` |
-| Order book imbalance | RTE | 5013 | `.rte.getImbalanceAll[]` |
-| Variance-covariance | RTE | 5013 | `.rte.getCorrelationTable[]` |
-| Analytics validity | RTE | 5013 | `.rte.getVwap[]`, `.rte.getVcov[]` (return `isValid`) |
-| DIB bars | MLE | 5015 | `.mle.getDIB[]` |
-| DRB bars | MLE | 5015 | `.mle.getDRB[]` |
-| ML label stats | MLE | 5015 | `.mle.labelStats[]` |
-| FH latency metrics | TEL | 5014 | `telemetry_latency_fh` |
-| E2E latency metrics | TEL | 5014 | `telemetry_latency_e2e` |
-| FH health status | TEL | 5014 | `.tel.vsFhStatus[]` |
-| System memory | TEL | 5014 | `.tel.vsSystemResources[]` |
-| Throughput | TEL | 5014 | Derived from `telemetry_latency_fh.cnt / 5` |
-
-**Trade-off acknowledged:** The reference architecture recommends:
-> "Processes accessed by users should be isolated from those performing core system calculations to improve stability and resource control."
-
-For this exploratory project with a single user, direct querying is acceptable. A UI cache or gateway would be introduced if user count grows.
+| Data | Source | Port | Query |
+|------|--------|------|-------|
+| Last trade price | RDB | 5017 | `trade_binance` |
+| Raw trade history | RDB | 5017 | `trade_binance` |
+| VWAP | RTE | 5015 | `.rte.getVwap[]` |
+| Daily volatility | RTE | 5015 | `.rte.getVol[]` |
+| L5 order book | RTE | 5015 | `.rte.getOrderBook[]` |
+| Order book imbalance | RTE | 5015 | `.rte.getOBIAll[]` |
+| DIB bars | MLE | 5012 | `.mle.getDIB[]` |
+| DRB bars | MLE | 5012 | `.mle.getDRB[]` |
+| ML label stats | MLE | 5012 | `.mle.labelStats[]` |
+| Current positions | MLE | 5012 | `.mle.getPositions[]` |
+| FH latency metrics | TEL | 5016 | `.tel.vsFhLatency[]` |
+| FH health status | TEL | 5016 | `.tel.vsFhStatus[]` |
+| Process health | Any | Various | `.health[]` |
 
 ### Dashboard Specification
 
-Four dashboards are defined:
-
 **Dashboard 1: Market Overview**
 
-| Panel | Data Source | Content | Update |
-|-------|-------------|---------|--------|
-| Last Price | WDB | Most recent trade price per symbol | 1 sec |
-| Rolling Avg Price | RTE | `avgPrice` from `.rte.getVwap[]` | 1 sec |
-| Trade Count | RTE | `tradeCount` from `.rte.getVwap[]` | 1 sec |
-| Price Chart | WDB | Time series of recent prices (last 5 min) | 1 sec |
-| VWAP Validity | RTE | `isValid` from `.rte.getVwap[]` | 1 sec |
-| Order Book | RTE | `.rte.getOrderBook[]` | 1 sec |
-| OBI Indicator | RTE | `.rte.getImbalanceAll[]` | 1 sec |
+| Panel | Data Source | Content |
+|-------|-------------|---------|
+| Last Price | RDB | Most recent trade price per symbol |
+| VWAP | RTE | `.rte.getVwap[]` |
+| Daily Vol | RTE | `.rte.getVol[]` |
+| Order Book | RTE | `.rte.getOrderBook[]` |
+| OBI Indicator | RTE | `.rte.getOBIAll[]` |
 
-**Dashboard 2: Latency Monitor**
+**Dashboard 2: System Health**
 
-| Panel | Data Source | Content | Update |
-|-------|-------------|---------|--------|
-| FH Parse Latency | TEL | p50/p95/max from `telemetry_latency_fh` | 1 sec |
-| FH Send Latency | TEL | p50/p95/max from `telemetry_latency_fh` | 1 sec |
-| E2E Latency | TEL | p50/p95/max from `telemetry_latency_e2e` | 1 sec |
-| Latency Time Series | TEL | Rolling chart of percentiles (last 5 min) | 1 sec |
-| Throughput Chart | TEL | `cnt / 5` from `telemetry_latency_fh` (events/sec) | 1 sec |
+| Panel | Data Source | Content |
+|-------|-------------|---------|
+| FH Health Grid | TEL | `.tel.vsFhStatus[]` |
+| FH Latency | TEL | `.tel.vsFhLatency[]` |
+| Trade Volume | RDB | Count per symbol |
+| Quote Volume | RDB | Count per symbol |
+| Process Health | All | `.health[]` from each process |
 
-**Dashboard 3: System Health**
+**Dashboard 3: ML Features**
 
-| Panel | Data Source | Content | Update |
-|-------|-------------|---------|--------|
-| FH Health Grid | TEL | `.tel.vsFhStatus[]` | 1 sec |
-| System Memory | TEL | `.tel.vsSystemResources[]` | 1 sec |
-| Data Volume | TEL | `.tel.vsDataVolume[]` | 1 sec |
-| Analytics Validity | RTE | `isValid` from `.rte.getVwap[]`, `.rte.getVcov[]` | 1 sec |
-| Data Freshness | WDB | Time since last trade per symbol | 1 sec |
-| Gap Indicator | WDB | Detected `fhSeqNo` gaps (if any) | 1 sec |
-
-**Dashboard 4: ML Features**
-
-| Panel | Data Source | Content | Update |
-|-------|-------------|---------|--------|
-| DIB Bar Summary | MLE | `.mle.barStats[]` | 1 sec |
-| DRB Bar Summary | MLE | `.mle.getDRB[]` count per symbol | 1 sec |
-| Recent DIB Bars | MLE | `.mle.getDIB[]` last 10 | 1 sec |
-| Label Distribution | MLE | `.mle.labelStats[]` | 1 sec |
-| Adaptive Thresholds | MLE | `.mle.thresholds[]` | 1 sec |
-
-### Validity Display
-
-Analytics validity (from ADR-004) is displayed using visual indicators:
-
-| Condition | Display |
-|-----------|---------|
-| `isValid = true` | Green indicator; normal value display |
-| `isValid = false`, partial data | Yellow indicator; value shown with warning |
-| `isValid = false`, insufficient data | Red indicator; value greyed out or hidden |
-
-Additionally:
-- VWAP shows `tradeCount` to indicate sample size
-- Var-covar shows `buckets` count to indicate data coverage
-- Tooltip explains validity meaning on hover
+| Panel | Data Source | Content |
+|-------|-------------|---------|
+| DIB Bar Summary | MLE | `.mle.barStats[]` |
+| DRB Bar Summary | MLE | `.mle.getDRB[]` count |
+| Label Distribution | MLE | `.mle.labelStats[]` |
+| Adaptive Thresholds | MLE | `.mle.thresholds[]` |
+| Current Positions | MLE | `.mle.getPositions[]` |
 
 ### Update Latency Expectations
 
 | Metric | Source | Target Latency (data age) |
 |--------|--------|---------------------------|
-| Last price | WDB | < 2 seconds |
-| Rolling avg | RTE | < 2 seconds |
-| Telemetry | TEL | < 7 seconds (5s bucket + 2s query) |
+| Last price | RDB | < 3 seconds (1s batch + 2s query) |
+| VWAP | RTE | < 3 seconds |
+| Telemetry | TEL | < 7 seconds (1s batch + 5s bucket + 1s query) |
 
-These targets are achievable with 1-second polling and account for:
+These targets account for:
+- Chained TP batch interval (1 second)
 - Poll interval (up to 1 second)
-- Query execution time (< 100ms expected)
-- Rendering time (< 100ms expected)
-- TEL bucket delay (5 seconds for telemetry data)
-
-The reference architecture notes:
-> "A minimum update interval of approximately 200 milliseconds is generally sufficient, as this aligns with the threshold at which the human eye can perceive simple visual changes."
-
-1-second polling is well within acceptable bounds for human observation.
-
-### Scalability Stance
-
-**Scalability is out of scope for the current phase.**
-
-The reference architecture describes a UI caching pattern for scale:
-> "A common approach to scaling visualisation workloads is the introduction of a server-side UI cache."
-
-For this project:
-- Single user (developer) assumed
-- Direct WDB/RTE/MLE/TEL queries acceptable
-- No UI cache implemented
-- No gateway process implemented
-
-If multiple users or higher query rates are needed:
-- Introduce UI cache process
-- Cache pre-computes common queries
-- Dashboards query cache instead of WDB/RTE/MLE/TEL
-
-### Intended Usage
-
-Dashboards are intended for:
-- Development validation
-- Real-time behaviour inspection
-- Latency and performance reasoning
-- Architecture exploration
-- ML feature monitoring
-
-They are **not** intended as:
-- End-user trading interfaces
-- Production monitoring (no alerting)
-- Historical analysis tools
+- Query execution time (< 100ms)
+- TEL aggregation bucket (5 seconds)
 
 ### Symbol Scope
 
@@ -245,122 +142,37 @@ Initial dashboards display data for:
 - ETHUSDT
 - SOLUSDT
 
-Each symbol has dedicated panels or can be filtered via dashboard controls.
-
 ## Rationale
 
 KX Dashboards with polling was selected because:
 
-- **Native integration** - No additional tooling or infrastructure required
-- **Rapid development** - Pre-built components for time-series visualisation
+- **Native integration** - No additional tooling required
+- **Rapid development** - Pre-built components
 - **Sufficient for purpose** - Human-scale observation doesn't require streaming
 - **Alignment with project goals** - Exploratory, not production-grade
-- **Consistency** - Data stays within KDB-X ecosystem
-
-## Alternatives Considered
-
-### 1. Streaming dashboards
-Rejected for current phase:
-- Adds complexity (subscription management, reconnection)
-- Not required for single-user development use
-- Premature optimisation
-
-May be introduced if real-time push updates become necessary.
-
-### 2. External BI tools (Grafana, Tableau)
-Rejected:
-- Requires additional infrastructure
-- Integration overhead
-- Distracts from core kdb exploration
-
-Grafana may be considered for production monitoring in future phases.
-
-### 3. Custom web UI
-Rejected:
-- Significant development effort
-- Out of scope for exploratory project
-- KX Dashboards sufficient for current needs
-
-### 4. Query on-demand only (no dashboards)
-Rejected:
-- Poor developer experience
-- Manual queries tedious for continuous observation
-- Dashboards add minimal overhead
-
-### 5. Dedicated UI cache/gateway
-Rejected for current phase:
-- Adds process complexity
-- Single user doesn't require isolation
-- Direct queries acceptable at current scale
-
-May be introduced if user count grows.
-
-### 6. Faster polling (200ms)
-Rejected:
-- Higher query load
-- No perceptible benefit for human observation
-- TEL data only updates every 5 seconds anyway
-
-### 7. Slower polling (5 seconds)
-Rejected:
-- Sluggish feel during development
-- Delays in observing system behaviour
-- 1-second provides better responsiveness for WDB/RTE data
-
-### 8. Separate throughput table in TEL
-Rejected:
-- Throughput is trivially derived from existing `cnt` field
-- No need for redundant storage
-- `events_per_sec = cnt / 5`
-
-### 9. Separate analytics health table in TEL
-Rejected:
-- RTE already exposes validity via query functions
-- Dashboard already queries RTE for analytics data
-- No duplication needed
 
 ## Consequences
 
 ### Positive
 
 - Rapid feedback during development
-- Clear visibility into raw data (WDB), analytics (RTE), ML features (MLE), and telemetry (TEL)
+- Clear visibility into analytics (RTE), ML features (MLE), and telemetry (TEL)
 - Tight integration with kdb ecosystem
 - Minimal infrastructure requirements
-- Validity indicators aid interpretation
-- Simple polling model easy to debug
-- No redundant tables (throughput derived, analytics health from RTE)
+- Simple polling model
+- Standardized `.health[]` across all processes for consistent monitoring
 
 ### Negative / Trade-offs
 
-- Polling introduces redundant queries (even when data unchanged)
-- Dashboards not optimised for large user populations
-- Fine-grained UI customisation is limited
-- Direct queries mix user and system load
-- No alerting capability (human must observe)
-- Telemetry has 5-second delay due to bucket size
-- Dashboard must query TEL and RTE for complete health picture
+- 1-second delay from Chained TP batching
+- Polling introduces redundant queries
+- No alerting capability
 
 These trade-offs are acceptable for the current phase.
 
-## Future Evolution
-
-| Enhancement | Trigger |
-|-------------|---------|
-| Streaming dashboards | Need for sub-second updates |
-| UI cache layer | Multiple concurrent users |
-| Gateway process | Query isolation requirement |
-| Grafana integration | Production monitoring needs |
-| Custom web UI | Specific UX requirements |
-| Alerting | Production deployment |
-| Historical dashboards | HDB implementation (ADR-003 evolution) |
-
 ## Links / References
 
-- `reference/kdbx-real-time-architecture-reference.md`
-- `notes/kdbx-real-time-architecture-measurement-notes.md`
-- `adr-001-timestamps-and-latency-measurement.md` (latency metrics definitions)
-- `adr-004-real-time-rolling-analytics-computation.md` (RTE analytics, validity flags)
-- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (TEL tables, bucket alignment)
-- `adr-006-recovery-and-replay-strategy.md` (gap detection display)
-- `adr-011-financial-machine-learning.md` (MLE bar queries)
+- `adr-001-timestamps-and-latency-measurement.md` (latency metrics)
+- `adr-004-real-time-rolling-analytics-computation.md` (RTE analytics)
+- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (TEL metrics)
+- `adr-011-financial-machine-learning.md` (MLE bar and position queries)
