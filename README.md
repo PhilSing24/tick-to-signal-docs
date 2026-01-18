@@ -41,10 +41,6 @@ The MLE implements **information-driven bars** from Marcos López de Prado's *Ad
 | **Dollar Imbalance Bars (DIB)** | Net buy/sell dollar pressure exceeds threshold | Informed trading activity |
 | **Dollar Runs Bars (DRB)** | Consecutive same-direction flow exceeds threshold | Persistent accumulation/distribution |
 
-**Why dollar-based?**
-- A $5 trade and a $500,000 trade are weighted appropriately
-- Cross-asset comparable (same threshold = same economic significance)
-- Robust to the tiny bot trades that dominate crypto markets
 
 **Position signals** are generated when buy dollar percentage crosses thresholds:
 - `buyDollarPct > 65%` → Long position
@@ -60,9 +56,6 @@ Thresholds adapt automatically via EWMA to changing market conditions.
 
 **Dataflow Monitoring** — Data volume, system resources, and end-to-end latency breakdown.
 
-![Dataflow Monitoring](images/DataFlowMonitoringView.png)
-
-**Trades and Quotes Monitoring** — Order Book and OHLC 
 
 ![Trades and Quotes Monitoring](images/TradesQuotesView.png)
 
