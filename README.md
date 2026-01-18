@@ -120,7 +120,6 @@ The two tables describe the divergences with the pattern recommendation in Build
 
 | Pattern | Reference Recommendation | Project Decision | Rationale |
 |---------|-------------------------|------------------|-----------|
-| **Batching** | Batch messages for throughput | Tick-by-tick for MLE, batched for RTE/TEL | Hybrid approach: latency-critical path (MLE) gets tick-by-tick; dashboard path gets 1-second batches |
 | **User isolation** | Separate UI cache layer | Direct queries to RDB/RTE/TEL | Acceptable for single-user development |
 
 ### Patterns Not Implemented
@@ -129,5 +128,4 @@ The two tables describe the divergences with the pattern recommendation in Build
 |---------|-------------------------|----------------|--------|
 | **FH local recovery log** | Feed handler maintains local log for replay after TP disconnect | Not implemented | Gaps during FH↔TP disconnect are permanent |
 | **Replicated feed handlers** | Multiple FH instances for resilience | Single instance | Single point of failure at ingestion boundary |
-| **Status propagation** | Pub/sub staleness cascade across components | Validity flags only (no automatic propagation) | Downstream must query validity rather than subscribe |
-| **Hot path separation** | Dedicated low-latency data flow via separate TP | Single TP with selective subscription | MLE subscribes to primary TP; RTE/TEL subscribe to Chained TP |
+| **Status propagation** | Pub/sub staleness cascade across components | Validity flags only | Downstream must query validity rather than subscribe |
