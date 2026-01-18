@@ -122,7 +122,6 @@ The two tables describe the divergences with the pattern recommendation in Build
 |---------|-------------------------|------------------|-----------|
 | **Batching** | Batch messages for throughput | Tick-by-tick for MLE, batched for RTE/TEL | Hybrid approach: latency-critical path (MLE) gets tick-by-tick; dashboard path gets 1-second batches |
 | **User isolation** | Separate UI cache layer | Direct queries to RDB/RTE/TEL | Acceptable for single-user development |
-| **Timer vs event-driven** | Event-driven processing preferred | Mixed (hot path event-driven, cold path timer-based) | Cleanup and reconnection are timer-based; bar emission is event-driven |
 
 ### Patterns Not Implemented
 
