@@ -14,7 +14,7 @@ The goal is to demonstrate that thoughtful architecture and code quality can ach
 
 ## Architecture
 
-![System Architecture](images/Architecture.png)
+![System Architecture](images/DiagramArchitectureOverview.jpg)
 
 The system follows the **KDB-X scaled tick architecture** pattern with clear separation of concerns:
 
